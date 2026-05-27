@@ -1,0 +1,28 @@
+# EIDL-Lumapi commands
+
+# Create and activate the environment.
+conda env create -f setting/environment.yml
+conda activate EIDL-Lumapi
+
+# Optional: only needed when Lumerical is not already installed under /opt/lumerical/v*.
+export EIDL_LUMERICAL_INSTALLER=/path/to/lumerical-installer-or-tree
+
+# First command performs one-time Lumerical/license auto-detection.
+resource
+
+# Run a Lumerical simulation script.
+run script_name.py -th 8 -GPU 2
+
+# Run with resource profiling.
+run script_name.py -th 8 -GPU 2 --profile
+
+# Default output root is /Lumerical_data if writable, otherwise ~/Lumerical_data.
+
+# Force a custom data directory.
+run script_name.py -th 8 -GPU 2 --outdir /path/to/Lumerical_data
+
+# The run command writes relative byproducts such as .fsp files under:
+# <selected output root>/<timestamp>_<tag>/
+
+# Profiling output is written under:
+# <selected output root>/<timestamp>_<tag>/profiling_results/

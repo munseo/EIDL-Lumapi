@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eidl-lumapi"
+version = "0.1.0"
+description = "Lumerical-focused EIDL optimization helpers."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "EIDL" }
+]
+dependencies = [
+  "autograd",
+  "h5py",
+  "gdspy",
+  "matplotlib",
+  "mpi4py",
+  "numpy",
+  "psutil",
+  "scipy",
+  "tqdm",
+]
+
+[project.scripts]
+resource = "msopt.cli.resource:main"
+run = "msopt.cli.run:main"
+
+[tool.setuptools]
+packages = ["msopt", "msopt.cli"]
