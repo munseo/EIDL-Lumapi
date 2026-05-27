@@ -395,14 +395,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--history-seconds",
         type=float,
-        default=float(os.environ.get("EIDL_RESOURCE_HISTORY_SECONDS", "60")),
-        help="Sample resource usage for this many seconds and report peak usage. Default: 60.",
+        default=float(os.environ.get("EIDL_RESOURCE_HISTORY_SECONDS", "5")),
+        help="Sample resource usage for this many seconds and report peak usage. Default: 5.",
     )
     parser.add_argument(
         "--sample-interval",
         type=float,
-        default=float(os.environ.get("EIDL_RESOURCE_SAMPLE_INTERVAL", "2")),
-        help="GPU history sample interval in seconds. Default: 2.",
+        default=float(os.environ.get("EIDL_RESOURCE_SAMPLE_INTERVAL", "0.5")),
+        help="GPU history sample interval in seconds. Default: 0.5.",
     )
     parser.add_argument(
         "--license-sample-interval",
