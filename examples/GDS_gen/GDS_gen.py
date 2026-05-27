@@ -24,8 +24,9 @@ import msopt as ms
 comm= MPI.COMM_WORLD
 rank= comm.Get_rank()
 
-design_dir = "./A/"
-local_best_dir = "./Local_bests/"
+RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
+design_dir = os.path.join(RUN_DIR, "A") + os.sep
+local_best_dir = os.path.join(RUN_DIR, "Local_bests") + os.sep
 mp.verbosity(1)
 # mp.verbosity.mpb =0
 if not os.path.exists(design_dir):

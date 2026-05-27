@@ -25,8 +25,9 @@ seed = 240
 np.random.seed(seed)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-design_dir = os.path.join(SCRIPT_DIR, 'A')
-local_best_dir = os.path.join(SCRIPT_DIR, 'Local_bests')
+RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
+design_dir = os.path.join(RUN_DIR, 'A') + os.sep
+local_best_dir = os.path.join(RUN_DIR, 'Local_bests') + os.sep
 os.makedirs(design_dir, exist_ok=True)
 os.makedirs(local_best_dir, exist_ok=True)
 
@@ -559,4 +560,3 @@ for seq in [0]:
             plt.axis('off')
             plt.savefig(os.path.join(design_dir, 'eps_last.png'))
             plt.close()
-

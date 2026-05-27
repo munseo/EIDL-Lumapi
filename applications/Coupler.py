@@ -40,8 +40,9 @@ prof = _NoOpProfiler()
 seed = 240
 np.random.seed(seed)
 
-design_dir = './A/'
-local_best_dir = './Local_bests/'
+RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
+design_dir = os.path.join(RUN_DIR, "A") + os.sep
+local_best_dir = os.path.join(RUN_DIR, "Local_bests") + os.sep
 os.makedirs(design_dir, exist_ok=True)
 os.makedirs(local_best_dir, exist_ok=True)
 

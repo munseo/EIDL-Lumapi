@@ -34,9 +34,10 @@ import msopt as ms
 seed = 240
 np.random.seed(seed)
 
-design_dir = "./A/"
+RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
+design_dir = os.path.join(RUN_DIR, "A") + os.sep
 os.makedirs(design_dir, exist_ok=True)
-local_dir = "./Local_bests/"
+local_dir = os.path.join(RUN_DIR, "Local_bests") + os.sep
 os.makedirs(local_dir, exist_ok=True)
 
 # -----------------------------------------------------------------------------
@@ -211,9 +212,11 @@ def active_pixel_mask(shape):
 theta_channel_centers_deg = np.array([0.0, 45.0])
 target_angle_efficiency_ratio_min = np.array([1.0, 0.85], dtype=float)
 target_angle_efficiency_ratio_max = np.array([1.0, 1.0], dtype=float)
-channel_polarizations = ("s", "p")
-polarization_angles = {"s": 0.0, "TE": 0.0, "p": 90.0, "TM": 90.0}
+channel_polarizations = ("x", "y")
+polarization_angles = {"x": 0.0, "y": 90.0}
+eml_component_by_polarization = {"x": "Ex", "y": "Ey"}
 target_distribution_weight = float(os.environ.get("MSOPT_OLED_DISTRIBUTION_WEIGHT", "10.0"))
+polarization_balance_weight = float(os.environ.get("MSOPT_OLED_POL_BALANCE_WEIGHT", "10.0"))
 
 
 def make_angular_target_channels():
@@ -239,6 +242,7 @@ def make_angular_target_channels():
                     "phi_deg": 0.0,
                     "polarization": pol,
                     "polarization_angle": polarization_angles[pol],
+                    "eml_component": eml_component_by_polarization[pol],
                     "target_ratio_to_zero_min": float(min_ratio),
                     "target_ratio_to_zero_max": float(max_ratio),
                     "source_power_norm": max(float(np.cos(theta_rad)), 1e-6),
@@ -258,9 +262,9 @@ target_channels = make_target_channels()
 N_fom = len(target_channels)
 
 
-# FoM: EML thin-film volume mean |E|^2 with uniformity and polarization balance.
+# FoM: each reciprocal linear-polarization channel couples to the matching EML
+# dipole component, then orthogonal channels are incoherently summed per angle.
 uniformity_power = 1.0
-component_balance_power = float(os.environ.get("MSOPT_OLED_COMPONENT_BALANCE_POWER", "1.0"))
 
 
 def _weighted_mean_abs_e2(E_x, E_y, E_z):
@@ -274,36 +278,32 @@ def _weighted_mean_abs_e2(E_x, E_y, E_z):
     return score
 
 
-def eml_isotropic_stats(E_x, E_y, E_z, eps=1e-30):
+def _select_eml_component(E_x, E_y, E_z, component):
+    if component == "Ex":
+        return E_x
+    if component == "Ey":
+        return E_y
+    if component == "Ez":
+        return E_z
+    raise ValueError(f"Unknown EML component: {component}")
+
+
+def eml_component_stats(E_x, E_y, E_z, component, eps=1e-30):
     mean_score = 0.0
     uniformity_score = 0.0
-    balance_score = 0.0
+    E_component = _select_eml_component(E_x, E_y, E_z, component)
     for fidx, wl_weight in enumerate(visible_weights):
-        Ex_i = E_x[:, :, :, fidx] if E_x.ndim == 4 else E_x
-        Ey_i = E_y[:, :, :, fidx] if E_y.ndim == 4 else E_y
-        Ez_i = E_z[:, :, :, fidx] if E_z.ndim == 4 else E_z
-        mask = active_pixel_mask(Ex_i.shape)
+        Ei = E_component[:, :, :, fidx] if E_component.ndim == 4 else E_component
+        mask = active_pixel_mask(Ei.shape)
         mask_sum = npa.maximum(npa.sum(mask), 1.0)
 
-        Ix = npa.abs(Ex_i) ** 2 * mask
-        Iy = npa.abs(Ey_i) ** 2 * mask
-        Iz = npa.abs(Ez_i) ** 2 * mask
-        intensity = (Ix + Iy + Iz) / 3.0
-
-        mx = npa.sum(Ix) / mask_sum
-        my = npa.sum(Iy) / mask_sum
-        mz = npa.sum(Iz) / mask_sum
-        arithmetic = (mx + my + mz) / 3.0
-        geometric = (mx * my * mz + eps) ** (1.0 / 3.0)
-        component_balance = geometric / (arithmetic + eps)
-
+        intensity = npa.abs(Ei) ** 2 * mask
         mean_intensity = npa.sum(intensity) / mask_sum
         mean_intensity_sq = npa.sum(intensity ** 2) / mask_sum
         uniformity = mean_intensity ** 2 / (mean_intensity_sq + eps)
         mean_score += wl_weight * mean_intensity
         uniformity_score += wl_weight * uniformity
-        balance_score += wl_weight * component_balance
-    return mean_score, uniformity_score, balance_score
+    return mean_score, uniformity_score
 
 
 def monitor_mean_abs_e2(sim, monitor_name):
@@ -312,18 +312,17 @@ def monitor_mean_abs_e2(sim, monitor_name):
     return float(np.real(_weighted_mean_abs_e2(Eall[..., 0], Eall[..., 1], Eall[..., 2])))
 
 
-def eml_isotropic_uniform_fom(E_x, E_y, E_z):
-    mean_intensity, uniformity, component_balance = eml_isotropic_stats(E_x, E_y, E_z)
-    return (
-        mean_intensity
-        * (uniformity + 1e-30) ** uniformity_power
-        * (component_balance + 1e-30) ** component_balance_power
-    )
+def eml_component_uniform_fom(E_x, E_y, E_z, component):
+    mean_intensity, uniformity = eml_component_stats(E_x, E_y, E_z, component)
+    return mean_intensity * (uniformity + 1e-30) ** uniformity_power
 
 
 def eml_abs_e2_intensity(E_x, E_y, E_z):
-    mean_intensity, _, _ = eml_isotropic_stats(E_x, E_y, E_z)
-    return mean_intensity
+    intensity = 0.0
+    for component in ("Ex", "Ey", "Ez"):
+        mean_intensity, _ = eml_component_stats(E_x, E_y, E_z, component)
+        intensity += mean_intensity
+    return intensity
 
 
 def real_scalar_or_none(value):
@@ -346,8 +345,33 @@ def angle_powers_from_channel_values(vals):
             idx for idx, channel in enumerate(target_channels)
             if channel["angle_idx"] == angle_idx
         ]
-        powers.append(npa.mean(vals[indices]))
+        powers.append(npa.sum(vals[indices]))
     return npa.array(powers)
+
+
+def angle_polarization_matrix(vals):
+    rows = []
+    for angle_idx in range(len(theta_channel_centers_deg)):
+        row = []
+        for pol in channel_polarizations:
+            indices = [
+                idx for idx, channel in enumerate(target_channels)
+                if channel["angle_idx"] == angle_idx and channel["polarization"] == pol
+            ]
+            if len(indices) != 1:
+                raise ValueError(f"Expected one channel for angle_idx={angle_idx}, pol={pol}.")
+            row.append(vals[indices[0]])
+        rows.append(row)
+    return npa.array(rows)
+
+
+def polarization_balance_penalty(vals):
+    matrix = angle_polarization_matrix(vals)
+    penalty = 0.0
+    for row in matrix:
+        mean_pol = npa.mean(row) + 1e-30
+        penalty += npa.mean(((row - mean_pol) / mean_pol) ** 2)
+    return penalty / max(len(theta_channel_centers_deg), 1)
 
 
 def combine_oled_scalar_from_values(vals):
@@ -361,8 +385,10 @@ def combine_oled_scalar_from_values(vals):
         (low_violation / (target_angle_efficiency_ratio_min + 1e-30)) ** 2
         + (high_violation / (target_angle_efficiency_ratio_max + 1e-30)) ** 2
     )
-    distribution_score = 1.0 / (1.0 + target_distribution_weight * distribution_penalty)
-    return total_power * distribution_score
+    pol_penalty = polarization_balance_penalty(vals)
+    penalty = target_distribution_weight * distribution_penalty + polarization_balance_weight * pol_penalty
+    penalty_score = 1.0 / (1.0 + penalty)
+    return total_power * penalty_score
 
 
 def combine_oled_metrics(channel_values):
@@ -383,12 +409,14 @@ def combine_oled_gradients(channel_values, channel_gradients):
 def print_oled_metric_summary(channel_values, label):
     vals = [float(np.real(v[0] if isinstance(v, (list, tuple, np.ndarray)) else v)) for v in channel_values]
     angle_powers = np.asarray(angle_powers_from_channel_values(np.asarray(vals, dtype=float)), dtype=float)
+    pol_matrix = np.asarray(angle_polarization_matrix(np.asarray(vals, dtype=float)), dtype=float)
     fractions = angle_powers / max(float(np.sum(angle_powers)), 1e-30)
     ratios_to_zero = angle_powers / max(float(angle_powers[0]), 1e-30)
     for idx, channel in enumerate(target_channels):
         print(
             f"{label} channel={channel['name']} reciprocal EML proxy={vals[idx]} "
             f"(theta={channel['theta_deg']:.1f}, pol={channel['polarization']}, "
+            f"component={channel['eml_component']}, "
             f"source_power_norm={channel['source_power_norm']:.6g})"
         )
     for angle_idx, theta_deg in enumerate(theta_channel_centers_deg):
@@ -396,6 +424,7 @@ def print_oled_metric_summary(channel_values, label):
             f"{label} theta={theta_deg:.1f} deg angle_power={angle_powers[angle_idx]} "
             f"fraction={fractions[angle_idx] * 100:.3f}% "
             f"ratio_to_0={ratios_to_zero[angle_idx]:.4f} "
+            f"x/y={pol_matrix[angle_idx, 0] / max(pol_matrix[angle_idx, 1], 1e-30):.4f} "
             f"(target_range={target_angle_efficiency_ratio_min[angle_idx]:.4f}-"
             f"{target_angle_efficiency_ratio_max[angle_idx]:.4f})"
         )
@@ -403,22 +432,23 @@ def print_oled_metric_summary(channel_values, label):
 
 def make_oled_fom(channel_idx, fom_history, source_norms):
     source_norm = max(float(source_norms[channel_idx]), 1e-30)
+    channel = target_channels[channel_idx]
+    component = channel["eml_component"]
 
     def J_oled(E_x, E_y, E_z):
-        raw_fom = eml_isotropic_uniform_fom(E_x, E_y, E_z)
-        raw_intensity, uniformity, component_balance = eml_isotropic_stats(E_x, E_y, E_z)
+        raw_fom = eml_component_uniform_fom(E_x, E_y, E_z, component)
+        raw_intensity, uniformity = eml_component_stats(E_x, E_y, E_z, component)
         intensity_gain = raw_intensity / source_norm
         fom = raw_fom / source_norm
         fom_value = real_scalar_or_none(fom)
         if fom_value is not None:
-            channel = target_channels[channel_idx]
             fom_history[channel_idx].append(fom_value)
             print(
                 f"[{boundary_label} channel {channel_idx}] {channel['name']} "
                 f"reciprocal EML proxy: {fom} "
-                f"(mean_isotropic_absE2={raw_intensity}, uniformity={uniformity}, "
-                f"component_balance={component_balance}, uniformity_power={uniformity_power}, "
-                f"component_balance_power={component_balance_power}, source_power_norm={source_norm}, "
+                f"(component={component}, mean_absE2={raw_intensity}, "
+                f"uniformity={uniformity}, uniformity_power={uniformity_power}, "
+                f"source_power_norm={source_norm}, "
                 f"intensity_gain={intensity_gain})"
             )
         return fom
@@ -596,7 +626,8 @@ def make_adjoint_loop(opt):
         print_oled_metric_summary(f0s, f"[{boundary_label}]")
         print(
             f"combined {boundary_label} OLED FoM: {f0} "
-            f"(distribution_weight={target_distribution_weight})"
+            f"(distribution_weight={target_distribution_weight}, "
+            f"polarization_balance_weight={polarization_balance_weight})"
         )
 
         if Case:
@@ -614,6 +645,7 @@ def save_postprocess_report(channel_values, combined_fom, suffix="final"):
         dtype=float,
     )
     angle_powers = np.asarray(angle_powers_from_channel_values(vals), dtype=float)
+    pol_matrix = np.asarray(angle_polarization_matrix(vals), dtype=float)
     fractions = angle_powers / max(float(np.sum(angle_powers)), 1e-30)
     ratios_to_zero = angle_powers / max(float(angle_powers[0]), 1e-30)
 
@@ -621,20 +653,24 @@ def save_postprocess_report(channel_values, combined_fom, suffix="final"):
     with open(metrics_path, "w", encoding="utf-8") as fp:
         fp.write(f"combined_fom {float(np.real(combined_fom)):.16e}\n")
         fp.write(f"distribution_weight {target_distribution_weight:.16e}\n")
+        fp.write(f"polarization_balance_weight {polarization_balance_weight:.16e}\n")
         fp.write("channels\n")
-        fp.write("index name theta_deg polarization source_power_norm reciprocal_eml_proxy\n")
+        fp.write("index name theta_deg polarization eml_component source_power_norm reciprocal_eml_proxy\n")
         for idx, channel in enumerate(target_channels):
             fp.write(
                 f"{idx} {channel['name']} {channel['theta_deg']:.8g} "
-                f"{channel['polarization']} {channel['source_power_norm']:.16e} "
+                f"{channel['polarization']} {channel['eml_component']} "
+                f"{channel['source_power_norm']:.16e} "
                 f"{vals[idx]:.16e}\n"
             )
         fp.write("angle_summary\n")
-        fp.write("theta_deg angle_power fraction ratio_to_zero target_ratio_min target_ratio_max\n")
+        fp.write("theta_deg angle_power fraction ratio_to_zero x_to_y target_ratio_min target_ratio_max\n")
         for idx, theta_deg in enumerate(theta_channel_centers_deg):
+            x_to_y = pol_matrix[idx, 0] / max(float(pol_matrix[idx, 1]), 1e-30)
             fp.write(
                 f"{theta_deg:.8g} {angle_powers[idx]:.16e} "
                 f"{fractions[idx]:.16e} {ratios_to_zero[idx]:.16e} "
+                f"{x_to_y:.16e} "
                 f"{target_angle_efficiency_ratio_min[idx]:.16e} "
                 f"{target_angle_efficiency_ratio_max[idx]:.16e}\n"
             )
@@ -772,6 +808,7 @@ if __name__ == "__main__":
         + ", ".join(
             f"{ch['name']} target_ratio_to_zero="
             f"{ch['target_ratio_to_zero_min']:.4f}-{ch['target_ratio_to_zero_max']:.4f} "
+            f"component={ch['eml_component']} "
             f"source_power_norm={ch['source_power_norm']:.4f}"
             for ch in target_channels
         )
@@ -779,8 +816,8 @@ if __name__ == "__main__":
     print(f"N_fom={N_fom}, design_grids={design_grids}, design_cells={design_cells}")
     print(f"boundary_mode={boundary_mode}, bc_x={bc_xy}, bc_y={bc_xy}, bc_z=PML")
     print(
-        "FoM=sum of source-power-normalized reciprocal EML coupling proxies, "
-        "weighted by target angular distribution match"
+        "FoM=sum of source-power-normalized matching-polarization EML coupling "
+        "proxies, weighted by target angular distribution and per-angle x/y balance"
     )
     print(f"visible_wavelengths={visible_wavelengths}")
     print(f"EML FoM plane center={eml_c}, size={eml_s}")

@@ -6,7 +6,7 @@ This script is the Lumerical-side counterpart of:
 
 Assumption:
   - SWAP.py already completed the seq==0 optimization stage
-  - ./A/lastdesign.txt exists
+  - <run_dir>/A/lastdesign.txt exists
 
 Outputs are written with the same legacy names consumed by OptField.m:
   - Real_flux_<m>_to_<n>.txt
@@ -35,9 +35,10 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-design_dir = os.path.join(SCRIPT_DIR, 'A')
-post_dir = os.path.join(SCRIPT_DIR, 'Post_process')
-data_dir = os.path.join(SCRIPT_DIR, 'Data')
+RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
+design_dir = os.path.join(RUN_DIR, 'A')
+post_dir = os.path.join(RUN_DIR, 'Post_process')
+data_dir = os.path.join(RUN_DIR, 'Data')
 os.makedirs(post_dir, exist_ok=True)
 os.makedirs(data_dir, exist_ok=True)
 

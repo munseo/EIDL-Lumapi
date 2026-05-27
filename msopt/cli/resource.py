@@ -4,6 +4,7 @@ import argparse
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 
 from .common import discover_lumerical, ensure_first_run_config, license_path, run_text
@@ -49,6 +50,40 @@ class GpuJob:
     process_name: str
     used_memory_mib: int
     task_name: str
+
+
+@dataclass
+class GpuPeak:
+    index: int
+    name: str
+    mem_total_mib: int
+    peak_util_pct: int = 0
+    peak_mem_used_mib: int = 0
+    peak_util_jobs: list[GpuJob] | None = None
+    peak_mem_jobs: list[GpuJob] | None = None
+    saw_jobs: bool = False
+    current: GpuInfo | None = None
+    samples: int = 0
+
+    @property
+    def peak_free_mib(self) -> int:
+        return max(self.mem_total_mib - self.peak_mem_used_mib, 0)
+
+
+@dataclass
+class LicensePeak:
+    feature: str
+    total: int | None = None
+    peak_used: int | None = None
+    current_used: int | None = None
+    source: str = ""
+    samples: int = 0
+
+    @property
+    def available_at_peak(self) -> int | None:
+        if self.total is None or self.peak_used is None:
+            return None
+        return max(self.total - self.peak_used, 0)
 
 
 def _license_from_lmstat(feature: str, license_server: str | None) -> LicenseUsage:
@@ -212,10 +247,139 @@ def _gpu_jobs(gpus: list[GpuInfo]) -> dict[int, list[GpuJob]]:
 
 
 def _allocatable_gpus(gpus: list[GpuInfo], max_util: int, min_free_mib: int) -> list[GpuInfo]:
+    del max_util, min_free_mib
+    jobs = _gpu_jobs(gpus)
     return [
         gpu
         for gpu in gpus
-        if gpu.util_pct <= max_util and gpu.free_mib >= min_free_mib
+        if not jobs.get(gpu.index)
+    ]
+
+
+def _job_lines(jobs: list[GpuJob] | None) -> list[str]:
+    if not jobs:
+        return ["no compute jobs detected"]
+    return [
+        (
+            f"{job.task_name} "
+            f"(pid={job.pid}, proc={job.process_name}, vram={job.used_memory_mib} MiB)"
+        )
+        for job in sorted(jobs, key=lambda item: item.used_memory_mib, reverse=True)
+    ]
+
+
+def _collect_gpu_history(seconds: float, interval: float) -> tuple[list[GpuInfo], dict[int, GpuPeak]]:
+    seconds = max(float(seconds), 0.0)
+    interval = max(float(interval), 0.2)
+    deadline = time.time() + seconds
+    peaks: dict[int, GpuPeak] = {}
+    last_gpus: list[GpuInfo] = []
+
+    while True:
+        gpus = _gpus()
+        jobs = _gpu_jobs(gpus)
+        last_gpus = gpus
+        for gpu in gpus:
+            peak = peaks.setdefault(
+                gpu.index,
+                GpuPeak(
+                    index=gpu.index,
+                    name=gpu.name,
+                    mem_total_mib=gpu.mem_total_mib,
+                ),
+            )
+            peak.current = gpu
+            peak.samples += 1
+            gpu_jobs = jobs.get(gpu.index, [])
+            if gpu_jobs:
+                peak.saw_jobs = True
+            if gpu.util_pct >= peak.peak_util_pct:
+                peak.peak_util_pct = gpu.util_pct
+                peak.peak_util_jobs = list(gpu_jobs)
+            if gpu.mem_used_mib >= peak.peak_mem_used_mib:
+                peak.peak_mem_used_mib = gpu.mem_used_mib
+                peak.peak_mem_jobs = list(gpu_jobs)
+
+        if seconds <= 0 or time.time() >= deadline:
+            break
+        time.sleep(min(interval, max(deadline - time.time(), 0.0)))
+
+    return last_gpus, peaks
+
+
+def _collect_resource_history(
+    seconds: float,
+    gpu_interval: float,
+    license_interval: float,
+    feature: str,
+    license_server: str | None,
+) -> tuple[list[GpuInfo], dict[int, GpuPeak], LicensePeak]:
+    seconds = max(float(seconds), 0.0)
+    gpu_interval = max(float(gpu_interval), 0.2)
+    license_interval = max(float(license_interval), 1.0)
+
+    deadline = time.time() + seconds
+    next_gpu_sample = 0.0
+    next_license_sample = 0.0
+    last_gpus: list[GpuInfo] = []
+    gpu_peaks: dict[int, GpuPeak] = {}
+    license_peak = LicensePeak(feature=feature)
+
+    while True:
+        now = time.time()
+
+        if now >= next_gpu_sample:
+            gpus = _gpus()
+            jobs = _gpu_jobs(gpus)
+            last_gpus = gpus
+            for gpu in gpus:
+                peak = gpu_peaks.setdefault(
+                    gpu.index,
+                    GpuPeak(
+                        index=gpu.index,
+                        name=gpu.name,
+                        mem_total_mib=gpu.mem_total_mib,
+                    ),
+                )
+                peak.current = gpu
+                peak.samples += 1
+                gpu_jobs = jobs.get(gpu.index, [])
+                if gpu_jobs:
+                    peak.saw_jobs = True
+                if gpu.util_pct >= peak.peak_util_pct:
+                    peak.peak_util_pct = gpu.util_pct
+                    peak.peak_util_jobs = list(gpu_jobs)
+                if gpu.mem_used_mib >= peak.peak_mem_used_mib:
+                    peak.peak_mem_used_mib = gpu.mem_used_mib
+                    peak.peak_mem_jobs = list(gpu_jobs)
+            next_gpu_sample = now + gpu_interval
+
+        if now >= next_license_sample:
+            usage = _license_from_lmstat(feature, license_server)
+            license_peak.samples += 1
+            license_peak.source = usage.source
+            if usage.total is not None:
+                license_peak.total = usage.total
+            if usage.used is not None:
+                license_peak.current_used = usage.used
+                if license_peak.peak_used is None or usage.used > license_peak.peak_used:
+                    license_peak.peak_used = usage.used
+            next_license_sample = time.time() + license_interval
+
+        if seconds <= 0 or time.time() >= deadline:
+            break
+
+        sleep_until = min(next_gpu_sample, next_license_sample, deadline)
+        time.sleep(max(min(sleep_until - time.time(), 0.5), 0.05))
+
+    return last_gpus, gpu_peaks, license_peak
+
+
+def _allocatable_from_peaks(peaks: dict[int, GpuPeak], max_util: int, min_free_mib: int) -> list[GpuPeak]:
+    return [
+        peak
+        for peak in sorted(peaks.values(), key=lambda item: item.index)
+        if not peak.saw_jobs
     ]
 
 
@@ -226,21 +390,57 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--feature", default="lum_fdtd_solve", help="License feature to inspect.")
     parser.add_argument("--license", help="License server/path. Defaults to ANSYSLMD_LICENSE_FILE.")
-    parser.add_argument("--max-gpu-util", type=int, default=10, help="GPU is allocatable when utilization is <= this value.")
-    parser.add_argument("--min-free-mib", type=int, default=1024, help="GPU is allocatable when free VRAM is >= this value.")
+    parser.add_argument("--max-gpu-util", type=int, default=10, help="Deprecated; allocatable now means no compute jobs detected.")
+    parser.add_argument("--min-free-mib", type=int, default=1024, help="Deprecated; allocatable now means no compute jobs detected.")
+    parser.add_argument(
+        "--history-seconds",
+        type=float,
+        default=float(os.environ.get("EIDL_RESOURCE_HISTORY_SECONDS", "60")),
+        help="Sample resource usage for this many seconds and report peak usage. Default: 60.",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=float(os.environ.get("EIDL_RESOURCE_SAMPLE_INTERVAL", "2")),
+        help="GPU history sample interval in seconds. Default: 2.",
+    )
+    parser.add_argument(
+        "--license-sample-interval",
+        type=float,
+        default=float(os.environ.get("EIDL_RESOURCE_LICENSE_INTERVAL", "10")),
+        help="License history sample interval in seconds. Default: 10.",
+    )
+    parser.add_argument("--instant", action="store_true", help="Skip history sampling and show current usage only.")
     args = parser.parse_args(argv)
     ensure_first_run_config(verbose=True)
     if not args.license:
         args.license = license_path()
 
-    usage = _license_from_lmstat(args.feature, args.license)
-    gpus = _gpus()
+    history_seconds = 0.0 if args.instant else max(float(args.history_seconds), 0.0)
+    if history_seconds > 0:
+        print(
+            f"Sampling resources for {history_seconds:g}s "
+            f"(gpu_interval={max(float(args.sample_interval), 0.2):g}s, "
+            f"license_interval={max(float(args.license_sample_interval), 1.0):g}s)..."
+        )
+    gpus, gpu_peaks, license_peak = _collect_resource_history(
+        history_seconds,
+        args.sample_interval,
+        args.license_sample_interval,
+        args.feature,
+        args.license,
+    )
     gpu_jobs = _gpu_jobs(gpus)
-    allocatable = _allocatable_gpus(gpus, args.max_gpu_util, args.min_free_mib)
+    if gpu_peaks:
+        allocatable_peaks = _allocatable_from_peaks(gpu_peaks, args.max_gpu_util, args.min_free_mib)
+        allocatable_gpu_indices = [peak.index for peak in allocatable_peaks]
+    else:
+        allocatable = _allocatable_gpus(gpus, args.max_gpu_util, args.min_free_mib)
+        allocatable_gpu_indices = [gpu.index for gpu in allocatable]
 
-    license_available = usage.available
+    license_available = license_peak.available_at_peak
     machine_max = len(gpus)
-    current_machine_available = len(allocatable)
+    current_machine_available = len(allocatable_gpu_indices)
     if license_available is None:
         runnable = current_machine_available
         limit_label = "license unknown, machine only"
@@ -248,40 +448,54 @@ def main(argv: list[str] | None = None) -> int:
         runnable = min(license_available, current_machine_available)
         limit_label = "min(available license, allocatable GPUs)"
 
-    total_limit = machine_max if usage.total is None else min(usage.total, machine_max)
+    total_limit = machine_max if license_peak.total is None else min(license_peak.total, machine_max)
 
     print("EIDL-Lumapi resources")
     print(f"  Lumerical feature       : {args.feature}")
-    print(f"  License source          : {usage.source}")
+    print(f"  License source          : {license_peak.source or '(unknown)'}")
     print(f"  License server/path     : {args.license or '(not set)'}")
-    if usage.total is None or usage.used is None:
+    if license_peak.total is None or license_peak.peak_used is None:
         print("  License usage           : unknown")
     else:
-        print(f"  License usage           : {usage.used}/{usage.total} in use, {usage.available} available")
+        print(
+            f"  License usage peak      : {license_peak.peak_used}/{license_peak.total} in use, "
+            f"{license_peak.available_at_peak} available "
+            f"(samples={license_peak.samples})"
+        )
+        if license_peak.current_used is not None:
+            print(f"  License usage current   : {license_peak.current_used}/{license_peak.total} in use")
     print(f"  Machine GPUs            : {machine_max}")
-    print(f"  Allocatable GPUs        : {', '.join(str(g.index) for g in allocatable) or '(none)'}")
+    print(f"  History window          : {history_seconds:g}s")
+    print(f"  Allocatable GPUs        : {', '.join(str(index) for index in allocatable_gpu_indices) or '(none)'}")
     print(f"  Runnable simulations    : {runnable}/{total_limit} ({limit_label})")
 
     if gpus:
         print("")
         print("GPU status")
-        for gpu in gpus:
-            marker = "*" if gpu in allocatable else " "
+        for gpu in sorted(gpus, key=lambda item: item.index):
+            marker = "*" if gpu.index in allocatable_gpu_indices else " "
+            peak = gpu_peaks.get(gpu.index)
             print(
                 f" {marker} GPU {gpu.index}: {gpu.name}, "
                 f"util={gpu.util_pct}%, mem={gpu.mem_used_mib}/{gpu.mem_total_mib} MiB, "
                 f"free={gpu.free_mib} MiB"
             )
-            jobs = gpu_jobs.get(gpu.index, [])
-            if jobs:
-                for job in jobs:
-                    print(
-                        f"     - {job.task_name} "
-                        f"(pid={job.pid}, proc={job.process_name}, vram={job.used_memory_mib} MiB)"
-                    )
+            if peak:
+                print(
+                    f"     peak over {history_seconds:g}s: "
+                    f"util={peak.peak_util_pct}%, "
+                    f"mem={peak.peak_mem_used_mib}/{peak.mem_total_mib} MiB, "
+                    f"free={peak.peak_free_mib} MiB, samples={peak.samples}"
+                )
+                print("     jobs at peak util:")
+                for line in _job_lines(peak.peak_util_jobs):
+                    print(f"       - {line}")
             else:
-                print("     - no compute jobs detected")
-        print("  * = allocatable by current thresholds")
+                print("     peak over history: unavailable")
+                print("     current jobs:")
+                for line in _job_lines(gpu_jobs.get(gpu.index, [])):
+                    print(f"       - {line}")
+        print("  * = no compute jobs detected during the history window")
     else:
         print("")
         print("GPU status")
