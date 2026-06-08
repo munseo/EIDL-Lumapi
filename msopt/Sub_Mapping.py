@@ -181,8 +181,10 @@ def get_reference_layer(#-- Input parameters ---------------------|
         x= x.flatten()                                                                       #                        |
         N_length += 2*Air_pad                                                                #                        |
         N_width  += 2*Air_pad                                                                #                        |
-        DR_width += 2*round(Air_pad/DR_res,2)                                                #                        |
-        DR_length += 2*round(Air_pad/DR_res,2)                                               #                        |
+        # Keep the padded physical span exactly consistent with the padded grid count.
+        # Rounding Air_pad / DR_res can make Filters.mesh_grid expect one fewer grid.
+        DR_width = (N_width - 1) / DR_res                                                    #                        |
+        DR_length = (N_length - 1) / DR_res                                                  #                        |
         print("Use Air pad")                                                                 #                        |
     else:                                                                                    #                        |
         Air_pad= 0                                                                           #                        |

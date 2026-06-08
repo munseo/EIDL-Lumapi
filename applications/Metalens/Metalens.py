@@ -52,12 +52,12 @@ bandwidth = 0.0
 
 aperture_x = 5.0
 aperture_y = 5.0
-focal_length = 1.5
+focal_length = 2.0
 
-simulation_height = 2.0
+simulation_height = 2.5
 substrate_h = 0.10
 spacer_h = 0.05
-design_h = 0.05
+design_h = 0.2
 bottom_air_h = 0.10
 top_air_h = simulation_height - bottom_air_h - substrate_h - spacer_h - design_h
 
@@ -91,7 +91,10 @@ source_c = [0, 0, Z_min + 0.02]
 input_monitor_s = [Sx, Sy, 0]
 input_monitor_c = [0, 0, Z_min + 0.08]
 
-fom_s = [Sx, Sy, 0]
+focus_window_x = 1.0
+focus_window_y = 1.0
+
+fom_s = [focus_window_x, focus_window_y, 0]
 fom_c = [0, 0, design_top_z + focal_length]
 
 vertical_monitor_s = [Sx, 0, Sz]
@@ -108,12 +111,11 @@ N_fom = 1
 air_n = [1.0]
 substrate_n = [1.45]
 spacer_n = [1.45]
-high_n = [2.0]
+high_n = [3.0]
 low_n = [1.0]
 
 target_NA = 0.80
-focus_window_x = 0.50
-focus_window_y = 0.50
+
 min_feature_size = 0.1
 min_gap_size = 0.1
 
@@ -128,26 +130,24 @@ def _h_components(result):
     return [arr[..., 0][:, :, :, 0], arr[..., 1][:, :, :, 0], arr[..., 2][:, :, :, 0]]
 
 
-def focus_mask(shape):
-    nx, ny = shape[:2]
-    x = np.linspace(-0.5 * Sx, 0.5 * Sx, nx)
-    y = np.linspace(-0.5 * Sy, 0.5 * Sy, ny)
-    X, Y = np.meshgrid(x, y, indexing="ij")
-    mask = (np.abs(X) <= 0.5 * focus_window_x) & (np.abs(Y) <= 0.5 * focus_window_y)
-    mask = mask.astype(float)
-    mask = mask / max(float(np.sum(mask)), 1e-30)
-    while mask.ndim < len(shape):
-        mask = mask[..., None]
-    return npa.array(np.broadcast_to(mask, shape))
-
-
 def normalized_focus_intensity(E_x, E_y, E_z):
     Ex = E_x[:, :, :, 0] if E_x.ndim == 4 else E_x
     Ey = E_y[:, :, :, 0] if E_y.ndim == 4 else E_y
     Ez = E_z[:, :, :, 0] if E_z.ndim == 4 else E_z
-    mask = focus_mask(Ex.shape)
     intensity = npa.abs(Ex) ** 2 + npa.abs(Ey) ** 2 + npa.abs(Ez) ** 2
-    return npa.sum(mask * intensity) / (Input_intensity + 1e-30)
+    return npa.sum(intensity) / (Input_intensity + 1e-30)
+
+
+def field_intensity(fields):
+    return float(
+        np.real(
+            np.sum(
+                np.abs(fields[0]) ** 2
+                + np.abs(fields[1]) ** 2
+                + np.abs(fields[2]) ** 2
+            )
+        )
+    )
 
 
 def save_field_preview(fields, path, title):
@@ -218,44 +218,23 @@ def add_static_stack(sim):
     )
 
 
-def initial_density_2d():
-    return np.ones(Nx * Ny) * 0.5#np.random.uniform(0.45, 0.55, Nx * Ny)
-
-
+DR_info = [design_s[0], design_s[1], design_s[2], 0, 1, 2]
+DR_N_info = [Nx, Ny, Nz, resolution]
 def build_mapping():
     return ms.Opt_MS2.Mapping(
         Symmetry_sim=False,
         Sym_geo_width=False,
+        Sym_geo_C8=False,
         Sym_geo_length=False,
         Sym_geo_C2=False,
-        DR_info=[design_s[0], design_s[1], design_s[2], 0, 1, 2],
-        DR_N_info=[Nx, Ny, Nz, resolution],
+        DR_info=DR_info,
+        DR_N_info=DR_N_info,
         Mask_pixels=0,
-        MFS=min_feature_size,
-        MGS=min_gap_size,
-        Is_freeform=[True, False, True],
+        MFS=0.1,
+        MGS=0.1,
+        Is_slanted_grating=False,
     )
 
-
-# =============================================================================
-# Target field for focusing FoM
-# =============================================================================
-target_file = design_dir / "Target_focus_xpol"
-with prof.step("Step0_target_field", locals(), globals()):
-    if not (target_file.with_suffix(".npz")).exists():
-        ms.Lumerical_module.Beam_save(
-            str(target_file),
-            fom_s,
-            fom_c,
-            resolution,
-            0,
-            wavelength,
-            target_NA,
-            0.0,
-            Pol="X",
-        )
-    Target_field = ms.Lumerical_module.vectoral_beam_load(str(target_file))
-    save_field_preview(Target_field, design_dir / "target_focus_profile.png", "Target focus field")
 
 
 # =============================================================================
@@ -296,7 +275,7 @@ with prof.step("Step3_norm_postprocess", locals(), globals()):
     Hin = _h_components(sim_norm.fdtd.getresult("input_monitor", "H"))
     Eprop = _field_components(sim_norm.fdtd.getresult("vertical_monitor", "E"))
     Input_power = ms.Opt_MS2.Cross_product(Ein, Hin)
-    Input_intensity = npa.sum(npa.abs(Ein[0]) ** 2 + npa.abs(Ein[1]) ** 2 + npa.abs(Ein[2]) ** 2)
+    Input_intensity = field_intensity(Ein)
     print(f"Input_power={Input_power}")
     print(f"Input_intensity={Input_intensity}")
     save_field_preview(Eprop, design_dir / "norm_vertical_profile.png", "Normalization propagation field")
@@ -311,7 +290,7 @@ with prof.step("Step4_Optimization_Init", locals(), globals()):
     opt = [None] * N_fom
     Foms_history = [[0], [0]]
 
-    x0 = initial_density_2d()
+    x0 = np.ones(Nx*Ny)*0.5
     mapping_preview = build_mapping()
     initial_design = mapping_preview(x0, 1.0)
     save_density_images(initial_design, "initial")

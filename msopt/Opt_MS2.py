@@ -119,6 +119,20 @@ def Back_traking_record(BT_history, fom_info, Backtraking_count):
     BT_history[Backtraking_count-1]=np.real(fom_info[Backtraking_count])
     return BT_history
 
+
+def _finite_fom_value(fom):
+    try:
+        value = float(np.real(fom))
+    except (TypeError, ValueError, OverflowError):
+        return -np.inf
+    if not np.isfinite(value):
+        return -np.inf
+    return value
+
+
+def _is_failed_fom(fom):
+    return _finite_fom_value(fom) <= -1e20
+
 """
 P1. inv_tanh_proj: inverse function of tanh
 P2. projection_error: projection error calculation for gradual evolve of the beta 
@@ -150,9 +164,12 @@ def projection_error(beta, eta):
 """ P3 """
 def Born_validity(dJ_dus, N_fom, top_k=50):
     for i in range(0, N_fom):
+        dJ_dus[i]= npa.where(npa.isfinite(dJ_dus[i]), dJ_dus[i], 0)
         outlier_th= npa.percentile(npa.abs(dJ_dus[i]), 99.9)
+        outlier_th= npa.where(npa.isfinite(outlier_th), outlier_th, 0)
         dJ_dus[i]= npa.where(npa.abs(dJ_dus[i])> outlier_th, 0, dJ_dus[i])
         born_th= npa.percentile(npa.abs(dJ_dus[i]), 100-top_k)
+        born_th= npa.where(npa.isfinite(born_th), born_th, 0)
         dJ_dus[i]= npa.where(npa.abs(dJ_dus[i])>= born_th, dJ_dus[i], 0)
     return dJ_dus
         
@@ -488,11 +505,11 @@ class OPT_Ms:
                 Armijo_cond=-1
             else: 
                 Armijo_cond= f_old+ (1/X.size)*(1/X.size)*alpha*grad_suff
-            if f0 < Armijo_cond and self.cur_iter[0]>1:     
+            if (f0 < Armijo_cond or _is_failed_fom(f0)) and self.cur_iter[0]>1:     
                 alpha_scale, bt_cnt= 0.1, 0
                 if grad_suff==0:
                     alpha_scale=0.01        
-                while bt_cnt < self.bt_tol and f0 < Armijo_cond:        
+                while bt_cnt < self.bt_tol and (f0 < Armijo_cond or _is_failed_fom(f0)):        
                     if bt_cnt == 0:       
                         foms_info,fom_info,bt_h,trig,stop= Back_tracking_init(f0, f0s, self.bt_tol) 
                     bt_cnt +=1            
@@ -527,6 +544,17 @@ class OPT_Ms:
                         if bt_cnt==self.bt_tol-1:
                             break
                     #-----------------------------------------------------------------#
+                if _is_failed_fom(f0):
+                    print(
+                        "[optimizer] all reduced steps remained unstable; "
+                        "rejecting this update and keeping the previous geometry."
+                    )
+                    self.Parameters[0] = alpha
+                    self.Parameters[1] = f_old
+                    self.Array[0] = v
+                    self.Array[1] = gJ * 0
+                    self.Array[4] = beta
+                    return
                 if self.Re_roll and self.Outer_M[1] <6 and f0 < f_old*0.9:
                     pass
                 else:
@@ -584,8 +612,11 @@ class OPT_Ms:
             if v.size > 0:                
                 gradient = v*0            
                 gradient[:] = tensor_jacobian_product(mapping, 0)(v_new, beta, g_m)# backprop #
+                gradient = npa.where(npa.isfinite(gradient), gradient, 0)
                 denorm_avg=npa.mean(npa.abs(gradient))
                 denorm_max=npa.max(npa.abs(gradient))
+                denorm_avg=npa.where(npa.isfinite(denorm_avg), denorm_avg, 0)
+                denorm_max=npa.where(npa.isfinite(denorm_max), denorm_max, 0)
                 self.Outer_M[2] = npa.sum(npa.where(((1e-3<X)&(X<(1-1e-3))), 0, 1))/X.size
 
             if self.Re_roll:
@@ -610,7 +641,11 @@ class OPT_Ms:
             print(f"Max dv: {denorm_max}, Mean dv: {denorm_avg}")
             print(f"Binarization rate: {round(self.Outer_M[2]*100,2)}%") 
             print(f"Learning rate: {(alpha)}\n")                                     
-            self.Array[1]= 0.5*gradient/denorm_max    
+            if denorm_max <= 0:
+                print("[optimizer] zero/non-finite gradient; using zero update direction")
+                self.Array[1]= gradient*0
+            else:
+                self.Array[1]= 0.5*gradient/denorm_max    
 
     """ Total loop """
     def __call__(self, mapping, N_fom, Adjoint):

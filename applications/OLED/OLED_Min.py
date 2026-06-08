@@ -59,22 +59,21 @@ if boundary_mode_key not in ("PML", "BLOCH", "PERIODIC"):
 bc_xy = {"PML": "PML", "BLOCH": "Bloch", "PERIODIC": "Periodic"}[boundary_mode_key]
 boundary_label = {"PML": "PML", "BLOCH": "Bloch", "PERIODIC": "Periodic"}[boundary_mode_key]
 
-window_x = 2.0
-window_y = 2.0
+window_x = 2.5
+window_y = 2.5
 active_x = window_x
 active_y = window_y
 
-ag_h = 0.20
-tpbi_h = 0.10
-eml_h = 0.10
-tcta_h = 0.10
-ito_h = 0.10
-sio2_base_h = 0.00
-grating_design_h = 0.50
-sio2_cap_h = 0.10
-air_top_h = 0.70
+air_top_h = 0.7
+sio2_h = 0.3
+grating_design_h = 0.5
+ito_h = 0.2
+tcta_h = 0.2
+eml_h = 0.2
+tpbi_h = 0.2
+ag_h = 0.2
 air_bot_h = 0.40
-Sz = air_bot_h + ag_h + tpbi_h + eml_h + tcta_h + ito_h + sio2_base_h + grating_design_h + sio2_cap_h + air_top_h
+Sz = air_bot_h + ag_h + tpbi_h + eml_h + tcta_h + ito_h  + grating_design_h + sio2_h + air_top_h
 
 Sx = window_x
 Sy = window_y
@@ -82,8 +81,6 @@ Z_min = -0.5 * Sz
 Z_max = 0.5 * Sz
 
 grating_initial_density = 0.5
-sio2_above_ito_h = sio2_base_h + grating_design_h + sio2_cap_h
-
 background_index = 1.0
 
 
@@ -91,16 +88,23 @@ background_index = 1.0
 # Layer materials from the provided 550 nm stack. Wavelength unit: um.
 # -----------------------------------------------------------------------------
 air_index = [1.0]
+design_high_index = {
+    "name": "OLED_grating_high_sampled",
+    "wavelength": [0.55],
+    "n": [1.45],
+    "k": [0.0],
+}
+design_low_index = air_index
 sio2_index = {
     "name": "OLED_SiO2_sampled",
     "wavelength": [0.55],
-    "n": [1.4516],
+    "n": [1.45],
     "k": [0.0],
 }
 ito_index = {
     "name": "OLED_ITO_sampled",
     "wavelength": [0.55],
-    "n": [1.8],
+    "n": [1.7],
     "k": [0.0],
 }
 tcta_index = {
@@ -118,7 +122,7 @@ eml_index = {
 tpbi_index = {
     "name": "OLED_TPBi_sampled",
     "wavelength": [0.55],
-    "n": [1.753],
+    "n": [1.75],
     "k": [0.0],
 }
 ag_index = {
@@ -127,13 +131,7 @@ ag_index = {
     "n": [0.76],
     "k": [5.9],
 }
-design_high_index = {
-    "name": "OLED_grating_high_sampled",
-    "wavelength": [0.55],
-    "n": [1.8],
-    "k": [0.0],
-}
-design_low_index = sio2_index
+
 
 
 # -----------------------------------------------------------------------------
@@ -163,19 +161,18 @@ ito_s = [Sx, Sy, ito_h]
 ito_c = [0, 0, z_cursor + 0.5 * ito_h]
 z_cursor += ito_h
 
+sio2_s = [Sx, Sy, sio2_h]
+sio2_c = [0, 0, z_cursor + 0.5 * sio2_h]
+z_cursor += sio2_h
+
 design_s = [Sx, Sy, grating_design_h]
 design_c = [0, 0, z_cursor + 0.5 * grating_design_h]
-z_cursor += grating_design_h
-
-sio2_base_s = [Sx, Sy, sio2_base_h]
-sio2_base_c = [0, 0, z_cursor + 0.5 * sio2_base_h]
-z_cursor += sio2_base_h
-
-sio2_cap_s = [Sx, Sy, sio2_cap_h]
-sio2_cap_c = [0, 0, z_cursor + 0.5 * sio2_cap_h]
 
 src_s = [Sx, Sy, 0]
 src_c = [0, 0, Z_max - 0.35]
+source_norm_monitor_name = "source_norm_monitor"
+source_norm_s = [Sx, Sy, 0]
+source_norm_c = [0, 0, src_c[2] - 0.05]
 
 out_s = [Sx, Sy, 0]
 out_c = [0, 0, Z_max - 0.15]
@@ -189,10 +186,6 @@ design_cells = Nx * Ny * Nz
 
 def initial_grating_density():
     return grating_initial_density * np.ones(design_grids)
-
-
-def initial_lens_density():
-    return initial_grating_density()
 
 
 def active_pixel_mask(shape):
@@ -224,7 +217,6 @@ combined_fom_history = []
 
 def env_flag(name, default="1"):
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
-
 
 def make_angular_target_channels():
     channels = []
@@ -264,7 +256,6 @@ base_radiation_channels = make_angular_target_channels()
 def make_target_channels():
     return [dict(base, wavelengths=np.asarray(visible_wavelengths, dtype=float)) for base in base_radiation_channels]
 
-
 target_channels = make_target_channels()
 N_fom = len(target_channels)
 
@@ -272,17 +263,6 @@ N_fom = len(target_channels)
 # FoM: each reciprocal linear-polarization channel couples to the matching EML
 # dipole component, then orthogonal channels are incoherently summed per angle.
 uniformity_power = 1.0
-
-
-def _weighted_mean_abs_e2(E_x, E_y, E_z):
-    score = 0.0
-    for fidx, wl_weight in enumerate(visible_weights):
-        Ex_i = E_x[:, :, :, fidx] if E_x.ndim == 4 else E_x
-        Ey_i = E_y[:, :, :, fidx] if E_y.ndim == 4 else E_y
-        Ez_i = E_z[:, :, :, fidx] if E_z.ndim == 4 else E_z
-        intensity = npa.abs(Ex_i) ** 2 + npa.abs(Ey_i) ** 2 + npa.abs(Ez_i) ** 2
-        score += wl_weight * npa.mean(intensity)
-    return score
 
 
 def _select_eml_component(E_x, E_y, E_z, component):
@@ -314,23 +294,9 @@ def eml_component_stats(E_x, E_y, E_z, component, eps=1e-30):
     return mean_score, uniformity_score
 
 
-def monitor_mean_abs_e2(sim, monitor_name):
-    Eres = sim.fdtd.getresult(monitor_name, "E")
-    Eall = np.array(Eres["E"], dtype=np.complex128)
-    return float(np.real(_weighted_mean_abs_e2(Eall[..., 0], Eall[..., 1], Eall[..., 2])))
-
-
 def eml_component_uniform_fom(E_x, E_y, E_z, component):
     mean_intensity, uniformity = eml_component_stats(E_x, E_y, E_z, component)
     return mean_intensity * (uniformity + 1e-30) ** uniformity_power
-
-
-def eml_abs_e2_intensity(E_x, E_y, E_z):
-    intensity = 0.0
-    for component in ("Ex", "Ey", "Ez"):
-        mean_intensity, _ = eml_component_stats(E_x, E_y, E_z, component)
-        intensity += mean_intensity
-    return intensity
 
 
 def real_scalar_or_none(value):
@@ -500,6 +466,57 @@ def make_oled_fom(channel_idx, fom_history, source_norms):
     return J_oled
 
 
+def monitor_mean_abs_e2(sim, monitor_name):
+    Eres = sim.fdtd.getresult(monitor_name, "E")
+    Eall = np.asarray(Eres["E"], dtype=np.complex128)
+    score = 0.0
+
+    if Eall.ndim >= 5:
+        n_freq = min(len(visible_weights), Eall.shape[-2])
+        for fidx in range(n_freq):
+            intensity = (
+                np.abs(Eall[..., fidx, 0]) ** 2
+                + np.abs(Eall[..., fidx, 1]) ** 2
+                + np.abs(Eall[..., fidx, 2]) ** 2
+            )
+            score += float(visible_weights[fidx]) * float(np.nanmean(intensity))
+    else:
+        intensity = (
+            np.abs(Eall[..., 0]) ** 2
+            + np.abs(Eall[..., 1]) ** 2
+            + np.abs(Eall[..., 2]) ** 2
+        )
+        score = float(np.nanmean(intensity))
+
+    return max(float(np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)), channel_power_floor)
+
+
+def delete_lumerical_object(fdtd, name):
+    fdtd.eval(
+        f'if (getnamednumber("{name}") > 0) {{'
+        f'select("{name}");'
+        f'delete;'
+        f'}}'
+    )
+
+
+def normalize_forward_source(sim, channel_idx, channel):
+    sim.add_monitor(
+        name=source_norm_monitor_name,
+        center=source_norm_c,
+        size=source_norm_s,
+    )
+    sim.run(name=f"source_norm_{channel_idx}", save=True)
+    source_norm = monitor_mean_abs_e2(sim, source_norm_monitor_name)
+    sim.fdtd.switchtolayout()
+    delete_lumerical_object(sim.fdtd, source_norm_monitor_name)
+    print(
+        f"[source normalization] channel {channel_idx} {channel['name']}: "
+        f"measured_mean_absE2={source_norm:.16e}, analytic_cos={channel['source_power_norm']:.16e}"
+    )
+    return source_norm
+
+
 def add_oled_stack(sim, wavelength):
     sim.add_geo(
         center=ag_c,
@@ -537,30 +554,16 @@ def add_oled_stack(sim, wavelength):
         wavelength=wavelength,
     )
     sim.add_geo(
-        center=design_c,
-        size=design_s,
+        center=sio2_c,
+        size=sio2_s,
         index=sio2_index,
-        name="SiO2_grating_region_background",
-        wavelength=wavelength,
-    )
-    if sio2_base_h > 0:
-        sim.add_geo(
-            center=sio2_base_c,
-            size=sio2_base_s,
-            index=sio2_index,
-            name="SiO2_base",
-            wavelength=wavelength,
-        )
-    sim.add_geo(
-        center=sio2_cap_c,
-        size=sio2_cap_s,
-        index=sio2_index,
-        name="SiO2_cap",
+        name="SiO2",
         wavelength=wavelength,
     )
 
 
 def build_optimization_problem():
+    use_source_normalization = env_flag("MSOPT_OLED_SOURCE_NORMALIZATION", "1")
     source_norms = np.asarray(
         [channel["source_power_norm"] for channel in target_channels],
         dtype=float,
@@ -596,6 +599,9 @@ def build_optimization_problem():
             phi=channel["phi_deg"],
             broadband=True,
         )
+
+        if use_source_normalization:
+            source_norms[idx] = normalize_forward_source(sim[idx], idx, channel)
 
         add_oled_stack(sim[idx], float(np.mean(visible_wavelengths)))
 
@@ -861,15 +867,6 @@ def _dipole_sample_positions(n_samples=20):
     return positions
 
 
-def _delete_if_exists(fdtd, name):
-    fdtd.eval(
-        f'if (getnamednumber("{name}") > 0) {{'
-        f'select("{name}");'
-        f'delete;'
-        f'}}'
-    )
-
-
 def _add_postprocess_dipole(fdtd, position, polarization):
     x, y, z = position
     theta_phi = {
@@ -877,7 +874,7 @@ def _add_postprocess_dipole(fdtd, position, polarization):
         "y": (90.0, 90.0),
     }
     theta, phi = theta_phi[polarization]
-    _delete_if_exists(fdtd, "postprocess_dipole")
+    delete_lumerical_object(fdtd, "postprocess_dipole")
     fdtd.adddipole()
     fdtd.set("name", "postprocess_dipole")
     fdtd.set("x", x * 1e-6)
@@ -1188,8 +1185,8 @@ if __name__ == "__main__":
     print(
         "OLED periodic 3D freeform setup: "
         f"period={window_x}x{window_y} um, active area={active_x}x{active_y} um, "
-        f"air={air_top_h} um, SiO2={sio2_cap_h + sio2_base_h} um, "
-        f"design={grating_design_h} um, ITO={ito_h} um, TCTA={tcta_h} um, "
+        f"air={air_top_h} um, design={grating_design_h} um, "
+        f"SiO2={sio2_h} um, ITO={ito_h} um, TCTA={tcta_h} um, "
         f"EML={eml_h} um, TPBi={tpbi_h} um, Ag={ag_h} um, "
         f"bottom_air_pad={air_bot_h} um, background_index={background_index}"
     )

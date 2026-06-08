@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import os
 import sys
+import configparser
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from . import Opt_MS2
@@ -194,8 +196,13 @@ class LumericalFDTDSimulator:
 
         if len(nz_dims) == 2:
             # set the normal axis to something consistent (e.g., Bloch or PML).
-            self.fdtd.set(f"{n_axis} min bc", "Bloch")
-            self.fdtd.set(f"{n_axis} max bc", "Bloch")
+            # In Lumerical's 2D mode (X-Y plane) the out-of-plane (z) boundary
+            # is inactive, so guard against "property inactive" errors.
+            try:
+                self.fdtd.set(f"{n_axis} min bc", "Bloch")
+                self.fdtd.set(f"{n_axis} max bc", "Bloch")
+            except Exception as _bc_exc:
+                print(f"[FDTD] skip out-of-plane '{n_axis}' BC (inactive in 2D): {_bc_exc}")
 
         # --- MESH CONTROL ---
         # If resolution or ppw specified -> create a single mesh override that spans the whole domain
@@ -1102,10 +1109,22 @@ class LumericalFDTDSimulator:
 
         self.design_n = n_ani.copy()
 
+        # importnk2 requires the z axis to have >= 2 layers even when the design
+        # (and its monitors) are a single 2D z-plane.  Duplicate the single
+        # design layer into a thin 2-layer slab centred on the design z-plane
+        # for the IMPORT ONLY; design_grids / design_z / monitors stay Nz=1.
+        z_geo_imp = np.asarray(self.design_z, dtype=float)
+        n_geo_imp = np.ascontiguousarray(n_ani)
+        if z_geo_imp.size == 1:
+            _dz = float(self.design_dz) if float(self.design_dz) > 0 else float(self.sim_grid)
+            z_geo_imp = np.array([z_geo_imp[0] - 0.5 * _dz,
+                                  z_geo_imp[0] + 0.5 * _dz], dtype=float)
+            n_geo_imp = np.ascontiguousarray(np.repeat(n_ani, 2, axis=2))
+
         self.fdtd.putv("x_geo", np.asarray(self.design_x, dtype=float))
         self.fdtd.putv("y_geo", np.asarray(self.design_y, dtype=float))
-        self.fdtd.putv("z_geo", np.asarray(self.design_z, dtype=float))
-        self.fdtd.putv("n_geo", np.ascontiguousarray(n_ani))
+        self.fdtd.putv("z_geo", z_geo_imp)
+        self.fdtd.putv("n_geo", n_geo_imp)
 
         if self.fdtd.getnamednumber(self.design_name) == 0:
             script = (
@@ -1137,9 +1156,92 @@ class LumericalFDTDSimulator:
         self._configure_design_region_objects()
 
 
+    def _configured_session_resource_names(self, resource_type="GPU"):
+        names = []
+        config_path = Path.home() / ".config" / "Lumerical" / "FDTD Solutions.ini"
+        if not config_path.exists():
+            return names
+        parser = configparser.RawConfigParser()
+        parser.optionxform = str
+        try:
+            parser.read(config_path)
+            xml_text = parser.get("jobmanager", "FDTD_v2", fallback="")
+            if not xml_text:
+                return names
+            root = ET.fromstring(xml_text)
+        except Exception as exc:
+            print(f"[FDTD] could not read Lumerical resource config: {exc}")
+            return names
+
+        requested = str(resource_type).upper()
+        for engine in root.findall("engine"):
+            name = (engine.findtext("name") or "").strip()
+            device_type = (engine.findtext("DeviceType") or "").strip().upper()
+            if not name:
+                continue
+            if requested == "GPU":
+                if device_type.startswith("GPU"):
+                    names.append(name)
+            elif requested == "CPU":
+                if device_type == "CPU":
+                    names.append(name)
+            else:
+                names.append(name)
+        return names
+
+    def _session_resource_names(self, resource_type="GPU"):
+        explicit = os.environ.get("LUMERICAL_SESSION_RESOURCE_NAME", "").strip()
+        names = []
+        if explicit:
+            names.append(explicit)
+        names.extend(self._configured_session_resource_names(resource_type))
+        if str(resource_type).upper() == "GPU":
+            names.extend([
+                "Local GPU",
+                "local GPU",
+                "Local Host",
+                "localhost",
+                "Localhost",
+                "Local Computer",
+                "local host",
+            ])
+        else:
+            names.extend([
+                "Local Host",
+                "localhost",
+                "Localhost",
+                "Local Computer",
+                "local host",
+            ])
+        unique = []
+        for name in names:
+            if name and name not in unique:
+                unique.append(name)
+        return unique
+
+    def _run_session_only(self, solver="FDTD", resource_type="GPU", run_name=""):
+        errors = []
+        for resource_name in self._session_resource_names(resource_type):
+            try:
+                print(
+                    f"[FDTD] session run: name={run_name}, solver={solver}, "
+                    f"resource_type={resource_type}, resource_name={resource_name}"
+                )
+                self.fdtd.run(solver, resource_type, resource_name)
+                return resource_name
+            except Exception as exc:
+                errors.append(f"{resource_name}: {exc}")
+        raise RuntimeError(
+            "Lumerical session run failed for all configured resource names. "
+            "External solver fallback is disabled. Set LUMERICAL_SESSION_RESOURCE_NAME "
+            "to the exact resource name shown in the Lumerical Resource Manager. "
+            "Tried: " + " | ".join(errors)
+        )
+
     def run(self,name="fdtd_tutorial",save=True):
+        fsp_path = os.path.abspath(f"{name}.fsp")
         if save:
-            self.fdtd.save(f"{name}.fsp")
+            self.fdtd.save(fsp_path)
         self.fdtd.switchtolayout()
         self.fdtd.eval("select(\"FDTD\");")
 
@@ -1148,7 +1250,7 @@ class LumericalFDTDSimulator:
         try:
             self.fdtd.setresource("FDTD", 1, "active", 1)
             self.fdtd.setresource("FDTD", 1, "processes", "1")
-            self.fdtd.setresource("FDTD", 1, "threads", "30")
+            self.fdtd.setresource("FDTD", 1, "threads", str(threads))
         except Exception:
             pass
         try:
@@ -1165,62 +1267,9 @@ class LumericalFDTDSimulator:
         except Exception:
             dimension = ""
         if dimension == "3D":
-            self.fdtd.run("FDTD", "GPU", "Local Host")
+            self._run_session_only("FDTD", "GPU", run_name=name)
         else:
             self.fdtd.run()
-
-    # def run(self, name="fdtd_run", save=True, gpu_id=0, threads=1, log_stdout=True):
-    #     """
-    #     Engine-only GPU run:
-    #     1) lumapi로 현재 프로젝트 저장
-    #     2) fdtd-engine-ompi-lcl -gpu 로 실행
-    #     3) 결과가 저장된 fsp를 다시 load
-    #     """
-
-    #     # 1. 저장
-    #     fsp_path = os.path.abspath(f"{name}.fsp")
-    #     self.fdtd.save(fsp_path)
-    #     print(f"[FDTD] Saved: {fsp_path}")
-
-    #     # 2. 엔진 경로 찾기
-    #     lum_root = os.environ.get("LUMERICAL_ROOT", "")
-    #     candidates = [
-    #         os.path.join(lum_root, "bin", "fdtd-engine-ompi-lcl") if lum_root else "",
-    #         shutil.which("fdtd-engine-ompi-lcl") or "",
-    #         shutil.which("fdtd-engine") or "",
-    #     ]
-    #     engine = next((p for p in candidates if p and os.path.exists(p)), None)
-    #     if engine is None:
-    #         raise FileNotFoundError(
-    #             "fdtd-engine-ompi-lcl not found. Set LUMERICAL_ROOT or PATH correctly."
-    #         )
-
-    #     # 3. 환경변수: 어떤 GPU를 쓸지 지정
-    #     env = os.environ.copy()
-    #     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    #     env.setdefault("OMPI_MCA_btl", "^openib")
-
-    #     # 라이선스는 기존 셸에서 잡힌 값 사용
-    #     # 필요하면 아래처럼 강제:
-    #     # env["ANSYSLMD_LICENSE_FILE"] = "1055@aigpu1123"
-
-    #     # 4. 엔진 실행: -gpu 가 핵심
-    #     cmd = [engine, "-gpu", "-t", str(threads), fsp_path]
-    #     if log_stdout:
-    #         cmd.insert(1, "-log-stdout")
-
-    #     print(f"[FDTD] Running: {' '.join(cmd)}")
-    #     print(f"[FDTD] CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
-
-    #     result = subprocess.run(cmd, env=env)
-    #     if result.returncode != 0:
-    #         raise RuntimeError(f"FDTD engine failed with code {result.returncode}")
-
-    #     print("[FDTD] Engine run finished")
-
-    #     # 5. 결과 다시 로드
-    #     self.fdtd.load(fsp_path)
-    #     print("[FDTD] Reloaded solved file")
 
 import tempfile, os
 import scipy.io as sio
@@ -1260,6 +1309,7 @@ class LumericalOptimizationProblem:
         self.forward_fields = None
         self.adjoint_fields = None
         self.FoM_fields = None
+        self.last_forward_had_nonfinite = False
         self.src_spectrum = None 
         self.iter=0
         self.rs_cnt=1
@@ -1479,11 +1529,20 @@ class LumericalOptimizationProblem:
         self.iter += 1
 
         self.sim.run(name="Forward_run", save=True)
-        self.forward_fields = self.get_field(
-            self.sim.design_monitor_name,
-            H_field=False,
-            check_design_alignment=True,
-        )
+        try:
+            self.forward_fields = self.get_field(
+                self.sim.design_monitor_name,
+                H_field=False,
+                check_design_alignment=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Forward session run finished without readable E result on "
+                f"{self.sim.design_monitor_name}. This usually means the Lumerical "
+                "session resource did not actually run the saved project. External solver "
+                "fallback is disabled. Check LUMERICAL_SESSION_RESOURCE_NAME and "
+                "the active GPU resource in Lumerical Resource Manager."
+            ) from exc
         spec = self.sim.fdtd.getresult("source", "spectrum")
 
         self.src_freqs = np.array(spec["f"]).reshape(-1)
@@ -1503,8 +1562,31 @@ class LumericalOptimizationProblem:
         self.sim.fdtd.setnamed('FoM_monitor', 'enabled', False)
         self.sim.fdtd.setnamed('source', 'enabled', False)
 
-        args = [self.FoM_fields[arg] for arg in self.objective_arguments]
-        self.f0 = [J(*args) for J in self.objective_functions]
+        args = []
+        self.last_forward_had_nonfinite = False
+        for arg in self.objective_arguments:
+            field_arg = np.asarray(self.FoM_fields[arg], dtype=np.complex128)
+            bad_count = np.count_nonzero(~np.isfinite(field_arg))
+            if bad_count:
+                self.last_forward_had_nonfinite = True
+                print(f"[forward_run] replaced non-finite FoM field component {arg}: {bad_count}")
+                field_arg = np.nan_to_num(field_arg, nan=0.0, posinf=0.0, neginf=0.0)
+                self.FoM_fields[arg] = field_arg
+            args.append(field_arg)
+        raw_f0 = [J(*args) for J in self.objective_functions]
+        self.last_forward_had_nonfinite = self.last_forward_had_nonfinite or any(
+            not np.isfinite(float(np.real(value))) if np.ndim(value) == 0 else False
+            for value in raw_f0
+        )
+        if self.last_forward_had_nonfinite:
+            print("[forward_run] candidate marked unstable; optimizer should reject/backtrack this step.")
+        self.f0 = raw_f0
+        self.f0 = [
+            float(np.nan_to_num(np.real(value), nan=0.0, posinf=0.0, neginf=0.0))
+            if np.ndim(value) == 0
+            else value
+            for value in self.f0
+        ]
         self.current_state = "FWD"
 
 
@@ -1525,10 +1607,11 @@ class LumericalOptimizationProblem:
         amps_sq = 0
         for arr in [dJEx_r, dJEy_r, dJEz_r, dJHx_r, dJHy_r, dJHz_r]:
             if arr is not None:
+                arr = np.nan_to_num(np.asarray(arr, dtype=np.complex128), nan=0.0, posinf=0.0, neginf=0.0)
                 amps_sq += np.abs(arr) ** 2
 
         max_amp = np.max(np.sqrt(amps_sq))
-        if max_amp == 0:
+        if not np.isfinite(max_amp) or max_amp == 0:
             print("[update_adjoint_dipole] all-zero dJ, no source added.")
             return
 
@@ -1558,7 +1641,9 @@ class LumericalOptimizationProblem:
             scale_i = 1j * omega_i * step_size
             if arr is None:
                 return np.zeros(shape3, dtype=np.complex128)
-            return np.array(arr[:, :, :, iidx], dtype=np.complex128) * scale_i
+            arr_i = np.array(arr[:, :, :, iidx], dtype=np.complex128)
+            arr_i = np.nan_to_num(arr_i, nan=0.0, posinf=0.0, neginf=0.0)
+            return arr_i * scale_i
 
         if self.broadband_adjoint and len(self.adj_wl) > 1:
             self.sim.fdtd.addimportedsource()
@@ -1755,6 +1840,12 @@ class LumericalOptimizationProblem:
     def calculate_gradient(self, debug_mode: bool =False):
         fwd = np.asarray(self.forward_fields, dtype=np.complex128)   # (3, Nx, Ny, Nz, Nf) raw node/corner
         adj = np.asarray(self.adjoint_fields, dtype=np.complex128)   # (3, Nx, Ny, Nz, Nf) raw node/corner
+        bad_fwd = np.count_nonzero(~np.isfinite(fwd))
+        bad_adj = np.count_nonzero(~np.isfinite(adj))
+        if bad_fwd or bad_adj:
+            print(f"[gradient_check] replaced non-finite fields: forward={bad_fwd}, adjoint={bad_adj}")
+            fwd = np.nan_to_num(fwd, nan=0.0, posinf=0.0, neginf=0.0)
+            adj = np.nan_to_num(adj, nan=0.0, posinf=0.0, neginf=0.0)
 
         if fwd.shape != adj.shape:
             raise RuntimeError(f"Forward/adjoint shape mismatch: fwd={fwd.shape}, adj={adj.shape}")
@@ -1801,6 +1892,9 @@ class LumericalOptimizationProblem:
         gx_eff = np.real(dedr_x * adj[0] * fwd[0])
         gy_eff = np.real(dedr_y * adj[1] * fwd[1])
         gz_eff = np.real(dedr_z * adj[2] * fwd[2])
+        gx_eff = np.nan_to_num(gx_eff, nan=0.0, posinf=0.0, neginf=0.0)
+        gy_eff = np.nan_to_num(gy_eff, nan=0.0, posinf=0.0, neginf=0.0)
+        gz_eff = np.nan_to_num(gz_eff, nan=0.0, posinf=0.0, neginf=0.0)
         gx_eff, gy_eff, gz_eff =self.assemble_boundary_tangent_gradient_mask(gx_eff, gy_eff, gz_eff)
 
         gx_node= self._pair_gather_backward(gx_eff, axis=0)
@@ -1823,6 +1917,7 @@ class LumericalOptimizationProblem:
                 self.gradient = Opt_MS2.Minimax(self.f0, dJ_dus)
             else:
                 self.gradient = np.sum(dJ_dus, axis=0).flatten()
+        self.gradient = np.nan_to_num(self.gradient, nan=0.0, posinf=0.0, neginf=0.0)
         print("[gradient_check] grad_3d_by_f.shape =", self.gradient.shape)
         return self.gradient.flatten()
 

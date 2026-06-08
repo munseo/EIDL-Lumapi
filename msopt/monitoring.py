@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import csv
 import functools
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -152,6 +154,62 @@ def _sample() -> dict[str, Any]:
     }
 
 
+def _short_list(items: list[str], limit: int = 30) -> str:
+    if not items:
+        return ""
+    shown = items[:limit]
+    suffix = "" if len(items) <= limit else f", ... (+{len(items) - limit} more)"
+    return ", ".join(shown) + suffix
+
+
+def _rough_size_bytes(value: Any, depth: int = 0, seen: set[int] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    obj_id = id(value)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+    try:
+        size = sys.getsizeof(value)
+    except Exception:
+        size = 0
+    if depth >= 2:
+        return size
+    if isinstance(value, dict):
+        for key, item in list(value.items())[:200]:
+            size += _rough_size_bytes(key, depth + 1, seen)
+            size += _rough_size_bytes(item, depth + 1, seen)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in list(value)[:200]:
+            size += _rough_size_bytes(item, depth + 1, seen)
+    elif hasattr(value, "nbytes"):
+        try:
+            size = max(size, int(value.nbytes))
+        except Exception:
+            pass
+    return size
+
+
+def _variable_snapshot(locals_dict: dict | None, globals_dict: dict | None) -> dict[str, Any]:
+    namespace: dict[str, Any] = {}
+    for source in (globals_dict or {}, locals_dict or {}):
+        for name, value in source.items():
+            if name.startswith("__"):
+                continue
+            if getattr(value, "__module__", None) == "builtins" and callable(value):
+                continue
+            namespace[name] = value
+    names = sorted(namespace)
+    total_size = 0
+    for value in namespace.values():
+        total_size += _rough_size_bytes(value)
+    return {
+        "names": names,
+        "count": len(names),
+        "size_MB": total_size / (1024 * 1024),
+    }
+
+
 class _Sampler(threading.Thread):
     def __init__(self, interval: float):
         super().__init__(daemon=True)
@@ -181,9 +239,15 @@ class StepRecord:
     start: dict[str, Any]
     end: dict[str, Any]
     samples: list[dict[str, Any]] = field(default_factory=list)
+    variables_start: dict[str, Any] = field(default_factory=dict)
+    variables_end: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         peaks = _peaks(self.samples or [self.start, self.end])
+        start_names = set(self.variables_start.get("names", []))
+        end_names = set(self.variables_end.get("names", []))
+        new_names = sorted(end_names - start_names)
+        removed_names = sorted(start_names - end_names)
         return {
             "name": self.name,
             "call_index": self.call_index,
@@ -197,9 +261,19 @@ class StepRecord:
             "python_threads_peak": peaks["python_threads_peak"],
             "children_threads_peak": peaks["children_threads_peak"],
             "total_threads_peak": peaks["total_threads_peak"],
+            "cpu_percent_peak": peaks["cpu_percent_peak"],
+            "active_logical_cores_peak": peaks["active_logical_cores_peak"],
             "gpu_global_vram_peak_MiB": peaks["gpu_global_vram_peak_MiB"],
             "gpu_util_peak_pct": peaks["gpu_util_peak_pct"],
             "process_gpu_vram_peak_MiB": peaks["process_gpu_vram_peak_MiB"],
+            "variables_count": self.variables_end.get("count", self.variables_start.get("count", 0)),
+            "variables_size_MB": round(
+                float(self.variables_end.get("size_MB", self.variables_start.get("size_MB", 0.0))),
+                4,
+            ),
+            "variables_present": sorted(end_names or start_names),
+            "new_variables": new_names,
+            "removed_variables": removed_names,
         }
 
 
@@ -222,10 +296,53 @@ def _peaks(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "python_threads_peak": max(int(s.get("threads", 0)) for s in samples),
         "children_threads_peak": max(int(s.get("children_threads", 0)) for s in samples),
         "total_threads_peak": max(int(s.get("total_threads", 0)) for s in samples),
+        "cpu_percent_peak": round(max(float(s.get("cpu_percent", 0.0)) for s in samples), 2),
+        "active_logical_cores_peak": round(max(float(s.get("cpu_percent", 0.0)) for s in samples) / 100.0, 2),
         "gpu_global_vram_peak_MiB": gpu_mem,
         "gpu_util_peak_pct": gpu_util,
         "process_gpu_vram_peak_MiB": proc_gpu,
     }
+
+
+def _gb(value_mb: float | int | None) -> float | str:
+    if value_mb is None:
+        return ""
+    return round(float(value_mb) / 1024.0, 3)
+
+
+def _max_gpu0_vram_gb(records: list[dict[str, Any]]) -> float:
+    values = []
+    for record in records:
+        gpu_mem = record.get("gpu_global_vram_peak_MiB", {})
+        if isinstance(gpu_mem, dict) and "0" in gpu_mem:
+            values.append(float(gpu_mem["0"]))
+    return float(max(values)) / 1024.0 if values else 0.0
+
+
+def _max_gpu0_util(records: list[dict[str, Any]]) -> float:
+    values = []
+    for record in records:
+        gpu_util = record.get("gpu_util_peak_pct", {})
+        if isinstance(gpu_util, dict) and "0" in gpu_util:
+            values.append(float(gpu_util["0"]))
+    return max(values) if values else 0.0
+
+
+def _leak_risk(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return "no"
+    first = records[0]
+    last = records[-1]
+    start = float(first.get("python_rss_start_MB", 0.0))
+    end = float(last.get("python_rss_end_MB", 0.0))
+    return "yes" if end - start > 50.0 and end > start * 1.15 else "no"
+
+
+def _group_step_dicts(records: list[StepRecord]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[record.name].append(record.to_dict())
+    return grouped
 
 
 class ResourceProfiler:
@@ -240,10 +357,10 @@ class ResourceProfiler:
 
     @contextmanager
     def step(self, name: str, locals_dict: dict | None = None, globals_dict: dict | None = None):
-        del locals_dict, globals_dict
         self._call_counts[name] += 1
         call_index = self._call_counts[name]
         start_wall = datetime.now().isoformat(timespec="seconds")
+        variables_start = _variable_snapshot(locals_dict, globals_dict)
         start = _sample()
         sampler = _Sampler(self.sample_interval)
         sampler.start()
@@ -254,6 +371,7 @@ class ResourceProfiler:
             elapsed = time.perf_counter() - start_t
             sampler.stop()
             end = _sample()
+            variables_end = _variable_snapshot(locals_dict, globals_dict)
             record = StepRecord(
                 name=name,
                 call_index=call_index,
@@ -262,6 +380,8 @@ class ResourceProfiler:
                 start=start,
                 end=end,
                 samples=sampler.samples,
+                variables_start=variables_start,
+                variables_end=variables_end,
             )
             self.records.append(record)
             with self.step_log.open("a", encoding="utf-8") as handle:
@@ -269,16 +389,18 @@ class ResourceProfiler:
 
     def save(self, path: str | Path | None = None, metadata: dict[str, Any] | None = None) -> Path:
         output = Path(path) if path else self.output_dir / "profile_result.json"
+        metadata = metadata or {}
         data = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "pid": os.getpid(),
-            "metadata": metadata or {},
+            "metadata": metadata,
             "total_steps": len(self.records),
             "steps": [record.to_dict() for record in self.records],
             "summary": self.summary(),
         }
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        self.export_ppt_csvs(metadata=metadata)
         print(f"[Profiler] saved: {output}")
         return output
 
@@ -313,6 +435,208 @@ class ResourceProfiler:
                 f"{item['time_total_sec']:>10.2f} {item['time_avg_sec']:>10.2f} "
                 f"{item['total_rss_peak_max_MB']:>10.1f} {item['total_threads_peak_max']:>8}"
             )
+
+    def export_ppt_csvs(self, metadata: dict[str, Any] | None = None) -> list[Path]:
+        metadata = metadata or {}
+        fdtd_threads = metadata.get("fdtd_threads") or os.environ.get("FDTD_THREADS") or ""
+        run_folder = Path(str(metadata.get("run_dir") or _run_dir())).name
+        description = metadata.get("description") or "EIDL-Lumapi profiling export"
+        grouped = _group_step_dicts(self.records)
+        step_rows: list[dict[str, Any]] = []
+        variable_rows: list[dict[str, Any]] = []
+
+        for stage, records in grouped.items():
+            times = [float(r["elapsed_sec"]) for r in records]
+            start_mb = float(records[0].get("python_rss_start_MB", 0.0))
+            end_mb = float(records[-1].get("python_rss_end_MB", 0.0))
+            present = sorted({name for r in records for name in r.get("variables_present", [])})
+            new_vars = sorted({name for r in records for name in r.get("new_variables", [])})
+            removed_vars = sorted({name for r in records for name in r.get("removed_variables", [])})
+            tracked = max(int(r.get("variables_count", 0)) for r in records)
+            var_size_mb = max(float(r.get("variables_size_MB", 0.0)) for r in records)
+            step_rows.append(
+                {
+                    "Stage": stage,
+                    "FDTD Threads": fdtd_threads,
+                    "Calls": len(records),
+                    "Total Time (s)": round(sum(times), 4),
+                    "Avg Time (s)": round(sum(times) / len(times), 4),
+                    "Max Time (s)": round(max(times), 4),
+                    "Peak Python RAM (GB)": _gb(max(float(r.get("python_rss_peak_MB", 0.0)) for r in records)),
+                    "Peak FDTD / Child RAM (GB)": _gb(max(float(r.get("children_rss_peak_MB", 0.0)) for r in records)),
+                    "Peak Total RAM (GB)": _gb(max(float(r.get("total_rss_peak_MB", 0.0)) for r in records)),
+                    "Net Python RAM Change (GB)": _gb(end_mb - start_mb),
+                    "Peak GPU0 VRAM (GB)": round(_max_gpu0_vram_gb(records), 3),
+                    "Peak GPU0 Utilization (%)": round(_max_gpu0_util(records), 3),
+                    "Peak Total Threads": max(int(r.get("total_threads_peak", 0)) for r in records),
+                    "Peak Logical Cores Seen": max(int(r.get("total_threads_peak", 0)) for r in records),
+                    "Peak Active Logical Cores": max(float(r.get("active_logical_cores_peak", 0.0)) for r in records),
+                    "Peak Physical Cores Seen": round(max(int(r.get("total_threads_peak", 0)) for r in records) / 2.0, 1),
+                    "Peak Active Physical Cores": round(max(float(r.get("active_logical_cores_peak", 0.0)) for r in records) / 2.0, 1),
+                    "Tracked Variables (#)": tracked,
+                    "Variables Snapshot Size (GB)": round(var_size_mb / 1024.0, 3),
+                    "New Variables (Unique #)": len(new_vars),
+                    "Removed Variables (Unique #)": len(removed_vars),
+                    "Swap Peak (kB)": 0.0,
+                    "Memory Leak Risk": _leak_risk(records),
+                }
+            )
+            variable_rows.append(
+                {
+                    "Stage": stage,
+                    "FDTD Threads": fdtd_threads,
+                    "Calls": len(records),
+                    "Tracked Variables (#)": tracked,
+                    "Variables Snapshot Size (MB)": round(var_size_mb, 2),
+                    "Variables Present": _short_list(present),
+                    "New Variables": _short_list(new_vars),
+                    "Removed Variables": _short_list(removed_vars),
+                }
+            )
+
+        def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> Path:
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            return path
+
+        outputs = [
+            write_csv(
+                self.output_dir / "ppt_step_resource_table_aggregated_gb.csv",
+                step_rows,
+                [
+                    "Stage",
+                    "FDTD Threads",
+                    "Calls",
+                    "Total Time (s)",
+                    "Avg Time (s)",
+                    "Max Time (s)",
+                    "Peak Python RAM (GB)",
+                    "Peak FDTD / Child RAM (GB)",
+                    "Peak Total RAM (GB)",
+                    "Net Python RAM Change (GB)",
+                    "Peak GPU0 VRAM (GB)",
+                    "Peak GPU0 Utilization (%)",
+                    "Peak Total Threads",
+                    "Peak Logical Cores Seen",
+                    "Peak Active Logical Cores",
+                    "Peak Physical Cores Seen",
+                    "Peak Active Physical Cores",
+                    "Tracked Variables (#)",
+                    "Variables Snapshot Size (GB)",
+                    "New Variables (Unique #)",
+                    "Removed Variables (Unique #)",
+                    "Swap Peak (kB)",
+                    "Memory Leak Risk",
+                ],
+            ),
+            write_csv(
+                self.output_dir / "ppt_step_variables_table_aggregated.csv",
+                variable_rows,
+                [
+                    "Stage",
+                    "FDTD Threads",
+                    "Calls",
+                    "Tracked Variables (#)",
+                    "Variables Snapshot Size (MB)",
+                    "Variables Present",
+                    "New Variables",
+                    "Removed Variables",
+                ],
+            ),
+        ]
+
+        bottleneck_rows = sorted(step_rows, key=lambda row: float(row["Total Time (s)"]), reverse=True)[:10]
+        outputs.append(
+            write_csv(
+                self.output_dir / "ppt_bottleneck_table_gb.csv",
+                [
+                    {
+                        "Bottleneck Stage": row["Stage"],
+                        "FDTD Threads": row["FDTD Threads"],
+                        "Calls": row["Calls"],
+                        "Total Time (s)": row["Total Time (s)"],
+                        "Avg Time per Call (s)": row["Avg Time (s)"],
+                        "Max Time per Call (s)": row["Max Time (s)"],
+                        "Peak Total RAM (GB)": row["Peak Total RAM (GB)"],
+                        "Peak FDTD / Child RAM (GB)": row["Peak FDTD / Child RAM (GB)"],
+                        "Peak GPU0 VRAM (GB)": row["Peak GPU0 VRAM (GB)"],
+                        "Peak Active Logical Cores": row["Peak Active Logical Cores"],
+                        "Memory Leak Risk": row["Memory Leak Risk"],
+                    }
+                    for row in bottleneck_rows
+                ],
+                [
+                    "Bottleneck Stage",
+                    "FDTD Threads",
+                    "Calls",
+                    "Total Time (s)",
+                    "Avg Time per Call (s)",
+                    "Max Time per Call (s)",
+                    "Peak Total RAM (GB)",
+                    "Peak FDTD / Child RAM (GB)",
+                    "Peak GPU0 VRAM (GB)",
+                    "Peak Active Logical Cores",
+                    "Memory Leak Risk",
+                ],
+            )
+        )
+
+        all_records = [record.to_dict() for record in self.records]
+        if all_records:
+            python_start = float(all_records[0].get("python_rss_start_MB", 0.0))
+            python_end = float(all_records[-1].get("python_rss_end_MB", 0.0))
+        else:
+            python_start = 0.0
+            python_end = 0.0
+        outputs.append(
+            write_csv(
+                self.output_dir / "ppt_overall_summary_table_aggregated_gb.csv",
+                [
+                    {
+                        "Run Folder": run_folder,
+                        "Description": description,
+                        "FDTD Threads": fdtd_threads,
+                        "Recorded Step Entries": len(self.records),
+                        "Unique Stages": len(grouped),
+                        "Python RAM at Start (GB)": _gb(python_start),
+                        "Python RAM at Last Record End (GB)": _gb(python_end),
+                        "Net Python RAM Change (GB)": _gb(python_end - python_start),
+                        "Overall Memory Leak Risk": _leak_risk(all_records),
+                        "Max Total RAM Peak (GB)": _gb(max((float(r.get("total_rss_peak_MB", 0.0)) for r in all_records), default=0.0)),
+                        "Max FDTD / Child RAM Peak (GB)": _gb(max((float(r.get("children_rss_peak_MB", 0.0)) for r in all_records), default=0.0)),
+                        "Max GPU0 VRAM Peak (GB)": round(_max_gpu0_vram_gb(all_records), 3),
+                        "Max Logical Cores Seen": max((int(r.get("total_threads_peak", 0)) for r in all_records), default=0),
+                        "Max Active Logical Cores": max((float(r.get("active_logical_cores_peak", 0.0)) for r in all_records), default=0.0),
+                        "Unique Variables Appeared": len({name for r in all_records for name in r.get("new_variables", [])}),
+                        "Unique Variables Removed": len({name for r in all_records for name in r.get("removed_variables", [])}),
+                    }
+                ],
+                [
+                    "Run Folder",
+                    "Description",
+                    "FDTD Threads",
+                    "Recorded Step Entries",
+                    "Unique Stages",
+                    "Python RAM at Start (GB)",
+                    "Python RAM at Last Record End (GB)",
+                    "Net Python RAM Change (GB)",
+                    "Overall Memory Leak Risk",
+                    "Max Total RAM Peak (GB)",
+                    "Max FDTD / Child RAM Peak (GB)",
+                    "Max GPU0 VRAM Peak (GB)",
+                    "Max Logical Cores Seen",
+                    "Max Active Logical Cores",
+                    "Unique Variables Appeared",
+                    "Unique Variables Removed",
+                ],
+            )
+        )
+
+        for output in outputs:
+            print(f"[Profiler] saved CSV: {output}")
+        return outputs
 
 
 class MonitoringSession:
