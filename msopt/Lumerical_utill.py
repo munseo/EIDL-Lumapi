@@ -40,9 +40,22 @@ except ModuleNotFoundError:
     import lumapi
 
 
+def _is_lumerical_messaging_error(exc):
+    text = str(exc)
+    markers = (
+        "Failed to start messaging",
+        "Failed to set up Ansys license sharing",
+        "ANSYSLI exited or could not read server port",
+        "Could not bind socket on port",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _open_lumerical_fdtd():
     session_hide = os.environ.get("LUMERICAL_SESSION_HIDE", "true").lower() == "true"
     session_platform = os.environ.get("LUMERICAL_SESSION_PLATFORM", "offscreen").strip()
+    retries = int(os.environ.get("LUMERICAL_SESSION_OPEN_RETRIES", "6"))
+    retry_delay = float(os.environ.get("LUMERICAL_SESSION_OPEN_RETRY_DELAY", "12"))
 
     attempts = []
     if session_platform:
@@ -52,13 +65,29 @@ def _open_lumerical_fdtd():
     attempts.append({})
 
     last_error = None
-    for kwargs in attempts:
-        try:
-            fdtd = lumapi.FDTD(**kwargs)
-            return fdtd
-        except Exception as exc:
-            last_error = exc
+    retries = max(1, retries)
+    for retry_idx in range(retries):
+        retryable_messaging_error = False
+        for kwargs in attempts:
+            try:
+                fdtd = lumapi.FDTD(**kwargs)
+                return fdtd
+            except Exception as exc:
+                last_error = exc
+                if _is_lumerical_messaging_error(exc):
+                    retryable_messaging_error = True
+                    break
+                continue
+
+        if retryable_messaging_error and retry_idx < retries - 1:
+            print(
+                "Failed to open Lumerical FDTD session; "
+                f"retrying in {retry_delay:g}s ({retry_idx + 1}/{retries - 1}). "
+                f"Last error: {last_error}"
+            )
+            time.sleep(retry_delay)
             continue
+        break
 
     raise RuntimeError(
         "Failed to open a Lumerical FDTD session. "
@@ -1158,8 +1187,13 @@ class LumericalFDTDSimulator:
 
     def _configured_session_resource_names(self, resource_type="GPU"):
         names = []
-        config_path = Path.home() / ".config" / "Lumerical" / "FDTD Solutions.ini"
-        if not config_path.exists():
+        config_paths = []
+        for home_value in (os.environ.get("HOME"), os.environ.get("EIDL_REAL_HOME")):
+            if home_value:
+                config_paths.append(Path(home_value).expanduser() / ".config" / "Lumerical" / "FDTD Solutions.ini")
+        config_paths.append(Path.home() / ".config" / "Lumerical" / "FDTD Solutions.ini")
+        config_path = next((path for path in config_paths if path.exists()), None)
+        if config_path is None:
             return names
         parser = configparser.RawConfigParser()
         parser.optionxform = str

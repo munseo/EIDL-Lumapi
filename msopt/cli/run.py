@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import subprocess
 import sys
+import socket
 from datetime import datetime
 from pathlib import Path
 
@@ -76,6 +78,100 @@ def _prepend_pythonpath(env: dict[str, str], paths: list[Path]) -> None:
     if existing:
         parts.append(existing)
     env["PYTHONPATH"] = os.pathsep.join(parts)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_ansys_port_file(path: Path) -> tuple[int, int] | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        port_text, pid_text = text.split(":", 1)
+        port = int(port_text)
+        pid = int(pid_text)
+    except Exception:
+        return None
+    if port <= 0 or pid <= 0 or not _pid_is_alive(pid):
+        return None
+    return port, pid
+
+
+def _lumerical_version_tag(root: str | None) -> str | None:
+    if not root:
+        return None
+    name = Path(root).name
+    if name.startswith("v") and name[1:].isdigit():
+        return name[1:]
+    digits = "".join(ch for ch in name if ch.isdigit())
+    return digits or None
+
+
+def _ensure_ansys_shared_port_link(env: dict[str, str]) -> str | None:
+    """Attach normal HOME runs to an already running redirected Ansys LI daemon.
+
+    Some Lumerical jobs redirect HOME to /tmp/tfln_lumerical_runtime_*.
+    Ansys license sharing then writes the .ansyscl port file under that
+    redirected HOME. A later normal run under /home/eidl may fail before
+    checkout because it looks for the same sharing context under ~/.ansys.
+    """
+    version = _lumerical_version_tag(env.get("LUMERICAL_ROOT"))
+    if not version:
+        return None
+
+    home = Path(env.get("HOME", str(Path.home()))).expanduser()
+    home_ansys = home / ".ansys"
+    try:
+        home_ansys.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    raw_host = socket.gethostname()
+    hosts = []
+    for host in (raw_host, raw_host.split(".", 1)[0]):
+        if host and host not in hosts:
+            hosts.append(host)
+    user = getpass.getuser()
+
+    for host in hosts:
+        acl = f"{host}_{host}_{user}_{version}"
+        filename = f".ansyscl.{host}.{acl}"
+        home_file = home_ansys / filename
+        existing_port = _read_ansys_port_file(home_file) if home_file.exists() else None
+        if existing_port:
+            if home_file.is_symlink():
+                port, pid = existing_port
+                return f"using existing {home_file} (port {port}, pid {pid})"
+            return None
+        if home_file.is_symlink():
+            try:
+                home_file.unlink()
+            except OSError:
+                return None
+        elif home_file.exists():
+            return None
+
+        candidates = []
+        for candidate in Path("/tmp").glob(f"tfln_lumerical_runtime_*/.ansys/{filename}"):
+            if _read_ansys_port_file(candidate):
+                candidates.append(candidate)
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        target = candidates[0]
+        try:
+            home_file.symlink_to(target)
+        except OSError:
+            return None
+        port, pid = _read_ansys_port_file(target) or (0, 0)
+        return f"linked {home_file} -> {target} (port {port}, pid {pid})"
+
+    return None
 
 
 def _stream_process(cmd: list[str], env: dict[str, str], log_path: Path, cwd: Path) -> int:
@@ -167,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         env["PATH"] = f"{install.bin_dir}:{env.get('PATH', '')}"
     if install.root:
         env["LUMERICAL_ROOT"] = env.get("LUMERICAL_ROOT", str(install.root))
+    ansys_link_message = _ensure_ansys_shared_port_link(env)
 
     tag = args.tag or f"{script.stem}_gpu{args.gpu}_th{args.threads}"
     desc = args.desc or f"GPU {args.gpu}, FDTD threads {args.threads}"
@@ -190,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  LUMERICAL_ROOT            : {env.get('LUMERICAL_ROOT', '(not detected)')}")
     print(f"  LUMERICAL_PYTHONPATH      : {env.get('LUMERICAL_PYTHONPATH', '(not detected)')}")
     print(f"  profiling                 : {'on' if env.get('MSOPT_PROFILE') == '1' else 'off'}")
+    if ansys_link_message:
+        print(f"  Ansys license sharing     : {ansys_link_message}")
     if output_warning:
         print(f"  output warning            : {output_warning}")
     print(f"  execution cwd             : {run_dir}")
@@ -218,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
             f"CPU affinity: {env.get('TASKSET_CPUS', '(disabled)')}",
             f"LUMERICAL_ROOT: {env.get('LUMERICAL_ROOT', '(not detected)')}",
             f"LUMERICAL_PYTHONPATH: {env.get('LUMERICAL_PYTHONPATH', '(not detected)')}",
+            f"Ansys license sharing: {ansys_link_message or '(default)'}",
             f"Command: {' '.join(cmd)}",
             f"Output log: {log_path}",
             f"Profiling: {'on' if env.get('MSOPT_PROFILE') == '1' else 'off'}",

@@ -208,8 +208,8 @@ target_angle_efficiency_ratio_max = np.array([1.0, 1.0], dtype=float)
 channel_polarizations = ("x", "y")
 polarization_angles = {"x": 0.0, "y": 90.0}
 eml_component_by_polarization = {"x": "Ex", "y": "Ey"}
-target_distribution_weight = float(os.environ.get("MSOPT_OLED_DISTRIBUTION_WEIGHT", "30.0"))
-polarization_balance_weight = float(os.environ.get("MSOPT_OLED_POL_BALANCE_WEIGHT", "10.0"))
+target_distribution_weight = float(os.environ.get("MSOPT_OLED_DISTRIBUTION_WEIGHT", "1.0"))
+polarization_balance_weight = float(os.environ.get("MSOPT_OLED_POL_BALANCE_WEIGHT", "1.0"))
 channel_power_floor = float(os.environ.get("MSOPT_OLED_CHANNEL_POWER_FLOOR", "1e-12"))
 unstable_candidate_fom = float(os.environ.get("MSOPT_OLED_UNSTABLE_CANDIDATE_FOM", "-1e30"))
 combined_fom_history = []
