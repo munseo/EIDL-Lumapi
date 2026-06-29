@@ -35,6 +35,102 @@ def tanh_projection_m(x: np.ndarray, beta: float, eta: float) -> np.ndarray:
             return (LR + npa.tanh(beta*(x-eta)))/(LR+HR)
         else:
             return npa.where(x < eta, (LR + npa.tanh(beta*(x-eta)))/(2*LR), (HR + npa.tanh(beta*(x-eta)))/(2*HR))
+
+
+def radial_cross_section_to_3d(
+    x,
+    DR_width,
+    N_width,
+    DR_length,
+    N_length,
+    N_height,
+    DR_res,
+    beta,
+    N_radius=None,
+    Radial_R=None,
+    outside_value=0.0,
+    Min_size_top=0.0,
+    Min_gap=0.0,
+    apply_filter=True,
+    vertical_grating=False,
+):
+    """Expand a radial design into the full x-y-z design grid."""
+    if N_height < 1:
+        raise ValueError("N_height must be at least 1 for radial 3D mapping.")
+    if Radial_R is None:
+        Radial_R = 0.5 * min(DR_width, DR_length)
+    if Radial_R <= 0:
+        raise ValueError("Radial_R must be positive for radial 3D mapping.")
+    if N_radius is None:
+        N_radius = int(round(Radial_R * DR_res)) + 1
+    N_radius = int(N_radius)
+    if N_radius < 1:
+        raise ValueError("N_radius must be at least 1 for radial 3D mapping.")
+
+    if vertical_grating:
+        x_r = npa.reshape(x, (N_radius,))
+        x_r = npa.clip(x_r, 0.0, 1.0)
+
+        if apply_filter and (Min_size_top > 0.0 or Min_gap > 0.0):
+            eta_ref = 0.05
+            filter_radius = get_conic_radius(max(Min_size_top + Min_gap, 1.0 / DR_res), 1 - eta_ref)
+            radial_span = (N_radius - 1) / DR_res if N_radius > 1 else 0.0
+            if radial_span > 0.0:
+                x_r = Ft.conic_filter(
+                    npa.reshape(x_r, (N_radius, 1)).flatten(),
+                    filter_radius,
+                    radial_span,
+                    0.0,
+                    [DR_res, 0],
+                )
+                x_r = npa.reshape(x_r, (N_radius,))
+                x_r = tanh_projection_m(x_r, beta, eta_ref)
+
+        x_r = tanh_projection_m(x_r, beta, 0.5)
+    else:
+        x_rz = npa.reshape(x, (N_radius, N_height))
+        x_rz = npa.clip(x_rz, 0.0, 1.0)
+
+        if apply_filter and (Min_size_top > 0.0 or Min_gap > 0.0):
+            eta_ref = 0.05
+            filter_radius = get_conic_radius(max(Min_size_top + Min_gap, 1.0 / DR_res), 1 - eta_ref)
+            radial_span = (N_radius - 1) / DR_res if N_radius > 1 else 0.0
+            height_span = (N_height - 1) / DR_res if N_height > 1 else 0.0
+            filter_resolution = [DR_res if N_radius > 1 else 0, DR_res if N_height > 1 else 0]
+            if radial_span > 0.0:
+                x_rz = Ft.conic_filter(
+                    x_rz.flatten(),
+                    filter_radius,
+                    radial_span,
+                    height_span,
+                    filter_resolution,
+                )
+                x_rz = npa.reshape(x_rz, (N_radius, N_height))
+                x_rz = tanh_projection_m(x_rz, beta, eta_ref)
+
+        x_rz = tanh_projection_m(x_rz, beta, 0.5)
+        x_rz_flat = x_rz.flatten()
+
+    width_grid = np.linspace(-DR_width / 2, DR_width / 2, N_width)
+    length_grid = np.linspace(-DR_length / 2, DR_length / 2, N_length)
+    W_g, L_g = np.meshgrid(width_grid, length_grid, indexing="ij")
+    R = np.sqrt(W_g**2 + L_g**2)
+
+    if N_radius == 1:
+        r_idx = np.zeros_like(R, dtype=int)
+    else:
+        radial_dr = Radial_R / (N_radius - 1)
+        r_idx = np.rint(R / radial_dr).astype(int)
+        r_idx = np.clip(r_idx, 0, N_radius - 1)
+    if vertical_grating:
+        x_2d = x_r[r_idx]
+        x_3d = npa.repeat(x_2d[:, :, None], N_height, axis=2)
+    else:
+        z_idx = np.arange(N_height, dtype=int)
+        flat_idx = r_idx[:, :, None] * N_height + z_idx[None, None, :]
+        x_3d = x_rz_flat[flat_idx]
+    x_3d = npa.where(R[:, :, None] <= Radial_R, x_3d, outside_value)
+    return x_3d.flatten()
 """
 2D to 3D Sub mapping moudule for x-cut LN waveguide's slanted side wall (67 deg)
 

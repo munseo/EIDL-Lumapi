@@ -612,11 +612,11 @@ class OPT_Ms:
             if v.size > 0:                
                 gradient = v*0            
                 gradient[:] = tensor_jacobian_product(mapping, 0)(v_new, beta, g_m)# backprop #
-                gradient = npa.where(npa.isfinite(gradient), gradient, 0)
+                # gradient = npa.where(npa.isfinite(gradient), gradient, 0)
                 denorm_avg=npa.mean(npa.abs(gradient))
                 denorm_max=npa.max(npa.abs(gradient))
-                denorm_avg=npa.where(npa.isfinite(denorm_avg), denorm_avg, 0)
-                denorm_max=npa.where(npa.isfinite(denorm_max), denorm_max, 0)
+                # denorm_avg=npa.where(npa.isfinite(denorm_avg), denorm_avg, 0)
+                # denorm_max=npa.where(npa.isfinite(denorm_max), denorm_max, 0)
                 self.Outer_M[2] = npa.sum(npa.where(((1e-3<X)&(X<(1-1e-3))), 0, 1))/X.size
 
             if self.Re_roll:
@@ -641,7 +641,7 @@ class OPT_Ms:
             print(f"Max dv: {denorm_max}, Mean dv: {denorm_avg}")
             print(f"Binarization rate: {round(self.Outer_M[2]*100,2)}%") 
             print(f"Learning rate: {(alpha)}\n")                                     
-            if denorm_max <= 0:
+            if denorm_max == 0:
                 print("[optimizer] zero/non-finite gradient; using zero update direction")
                 self.Array[1]= gradient*0
             else:
@@ -803,6 +803,7 @@ class Mapping:
         Is_1D_grating=[False, False], # Is 1D grating?, Is slanted?
         Is_freeform=[False, False, False], # Is Free-form?, Is gray-scale?, Is Single layer?
         Is_slanted_grating=False,
+        Is_radial_3d=None,
     ):
         self.MFS = MFS
         self.MFS0 =MFS
@@ -822,9 +823,37 @@ class Mapping:
         self.Sym_geo_length=Sym_geo_length
         self.Is_1D_grating = Is_1D_grating
         self.Is_Cylindrical= Is_Cylindrical
+        self.Is_radial_3d = Is_radial_3d
+        self.radial_3d_enabled = False
+        self.radial_3d_apply_filter = True
+        self.radial_3d_radius = None
+        self.radial_3d_outside_value = 0.0
+        self.N_radius = None
+        self.radial_3d_vertical_grating = False
         self.slanted= Is_slanted_grating
         self.N_height=DR_N_info[DR_info[5]]
-        if Is_freeform[0] and not Is_freeform[2]:
+        if isinstance(Is_radial_3d, dict):
+            self.radial_3d_enabled = bool(Is_radial_3d.get("enabled", False))
+            self.N_radius = Is_radial_3d.get("N_radius", None)
+            self.radial_3d_radius = Is_radial_3d.get("radius", None)
+            self.radial_3d_outside_value = Is_radial_3d.get("outside_value", 0.0)
+            self.radial_3d_apply_filter = bool(Is_radial_3d.get("apply_filter", True))
+            self.radial_3d_vertical_grating = bool(Is_radial_3d.get("vertical_grating", False))
+        elif isinstance(Is_radial_3d, bool):
+            self.radial_3d_enabled = Is_radial_3d
+        elif Is_radial_3d is not None:
+            self.radial_3d_enabled = bool(Is_radial_3d[0])
+            if len(Is_radial_3d) > 1:
+                self.N_radius = Is_radial_3d[1]
+            if len(Is_radial_3d) > 2:
+                self.radial_3d_radius = Is_radial_3d[2]
+            if len(Is_radial_3d) > 3:
+                self.radial_3d_outside_value = Is_radial_3d[3]
+            if len(Is_radial_3d) > 4:
+                self.radial_3d_apply_filter = bool(Is_radial_3d[4])
+            if len(Is_radial_3d) > 5:
+                self.radial_3d_vertical_grating = bool(Is_radial_3d[5])
+        if Is_freeform[0] and not Is_freeform[2] and not self.radial_3d_enabled:
             print("\n This is Freeform topology optimization \n")
             return
         if DR_info[5] == DR_info[4] or DR_info[5] == DR_info[3]:
@@ -855,6 +884,25 @@ class Mapping:
                 self.N_width =DR_N_info[DR_info[3]]
                 self.Mask_info[0]=0
                 self.Mask_info[1]=0
+        if self.radial_3d_enabled:
+            if self.radial_3d_radius is None:
+                self.radial_3d_radius = 0.5 * min(self.DR_width, self.DR_length)
+            if self.N_radius is None:
+                self.N_radius = int(round(self.radial_3d_radius * self.DR_res)) + 1
+            self.N_radius = int(self.N_radius)
+            if self.radial_3d_vertical_grating:
+                self.parameter_shape = (self.N_radius,)
+                self.parameter_count = self.N_radius
+            else:
+                self.parameter_shape = (self.N_radius, self.N_height)
+                self.parameter_count = self.N_radius * self.N_height
+            self.output_shape = (self.N_width, self.N_length, self.N_height)
+            print(
+                "Radial 3D mapping: "
+                f"rho({'r' if self.radial_3d_vertical_grating else 'r,z'}) "
+                f"{self.parameter_shape} -> xyz {self.output_shape}, "
+                f"R={self.radial_3d_radius}"
+            )
     
     def __call__(
         self,
@@ -863,6 +911,24 @@ class Mapping:
         Is_opt=True,
     ) -> np.ndarray:
         if Is_opt:  # Filter & Projection based Mapping function
+            if self.radial_3d_enabled:
+                return Sub_Mapping.radial_cross_section_to_3d(
+                    x=x,
+                    DR_width=self.DR_width,
+                    N_width=self.N_width,
+                    DR_length=self.DR_length,
+                    N_length=self.N_length,
+                    N_height=self.N_height,
+                    DR_res=self.DR_res,
+                    beta=beta,
+                    N_radius=self.N_radius,
+                    Radial_R=self.radial_3d_radius,
+                    outside_value=self.radial_3d_outside_value,
+                    Min_size_top=self.MFS0 if self.MFS0 is not None else 0.0,
+                    Min_gap=self.MGS0 if self.MGS0 is not None else 0.0,
+                    apply_filter=self.radial_3d_apply_filter,
+                    vertical_grating=self.radial_3d_vertical_grating,
+                )
             if self.Is_freeform[0]:
                 if beta>2:
                     eee=-0.5
@@ -996,6 +1062,24 @@ class Mapping:
                             )
                         x_copy = npa.reshape(x_copy,(self.N_height,self.N_width*self.N_length)).transpose()
         else: # 2D -> 3D projection of optimized reference layer
+            if self.radial_3d_enabled:
+                return Sub_Mapping.radial_cross_section_to_3d(
+                    x=x,
+                    DR_width=self.DR_width,
+                    N_width=self.N_width,
+                    DR_length=self.DR_length,
+                    N_length=self.N_length,
+                    N_height=self.N_height,
+                    DR_res=self.DR_res,
+                    beta=beta,
+                    N_radius=self.N_radius,
+                    Radial_R=self.radial_3d_radius,
+                    outside_value=self.radial_3d_outside_value,
+                    Min_size_top=self.MFS0 if self.MFS0 is not None else 0.0,
+                    Min_gap=self.MGS0 if self.MGS0 is not None else 0.0,
+                    apply_filter=self.radial_3d_apply_filter,
+                    vertical_grating=self.radial_3d_vertical_grating,
+                )
             if self.Is_waveguide[2]: # Is Slanted 3D Waveguide?
                 x_copy= Sub_Mapping.Slant_sidewall(
                     Number_of_local_region=self.Is_waveguide[3],

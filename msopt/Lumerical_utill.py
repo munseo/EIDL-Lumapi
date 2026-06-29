@@ -200,6 +200,8 @@ class LumericalFDTDSimulator:
         self.ppw = points_per_wavelength
         self.bc = {'x': bc_x, 'y': bc_y, 'z': bc_z}
         self.material_cache = {}
+        self.src_wl = np.asarray([center_wl], dtype=float).reshape(-1) * self.unit
+        self.src_bw = 0.0
 
         # FDTD region
         self.fdtd.addfdtd()
@@ -1272,13 +1274,7 @@ class LumericalFDTDSimulator:
             "Tried: " + " | ".join(errors)
         )
 
-    def run(self,name="fdtd_tutorial",save=True):
-        fsp_path = os.path.abspath(f"{name}.fsp")
-        if save:
-            self.fdtd.save(fsp_path)
-        self.fdtd.switchtolayout()
-        self.fdtd.eval("select(\"FDTD\");")
-
+    def _configure_session_resources(self):
         gpu_device = os.environ.get("LUMERICAL_SESSION_GPU_DEVICE", "GPU 0")
         threads = os.environ.get("FDTD_THREADS", "1")
         try:
@@ -1296,12 +1292,61 @@ class LumericalFDTDSimulator:
         except Exception:
             pass
 
+    def _run_log_tail(self, run_name, max_chars=3000):
+        log_path = Path(f"{run_name}_p0.log")
+        if not log_path.exists():
+            return ""
+        try:
+            text = log_path.read_text(errors="replace")
+        except Exception:
+            return ""
+        return text[-max_chars:]
+
+    def run(self,name="fdtd_tutorial",save=True):
+        fsp_path = os.path.abspath(f"{name}.fsp")
+        self._last_run_fsp_path = fsp_path
+        if save:
+            self.fdtd.save(fsp_path)
+        self.fdtd.switchtolayout()
+        self.fdtd.eval("select(\"FDTD\");")
+
+        self._configure_session_resources()
+
         try:
             dimension = str(self.fdtd.getnamed("FDTD", "dimension"))
         except Exception:
             dimension = ""
         if dimension == "3D":
-            self._run_session_only("FDTD", "GPU", run_name=name)
+            retries = max(1, int(os.environ.get("LUMERICAL_SESSION_RUN_RETRIES", "3")))
+            retry_delay = float(os.environ.get("LUMERICAL_SESSION_RUN_RETRY_DELAY", "5"))
+            last_error = None
+            for attempt in range(retries):
+                try:
+                    self._configure_session_resources()
+                    self._run_session_only("FDTD", "GPU", run_name=name)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= retries - 1:
+                        break
+                    print(
+                        "[FDTD] session run failed; reloading saved project and "
+                        f"retrying in {retry_delay:g}s ({attempt + 1}/{retries - 1}). "
+                        f"Last error: {exc}"
+                    )
+                    time.sleep(retry_delay)
+                    try:
+                        self.fdtd.switchtolayout()
+                        self.fdtd.load(fsp_path)
+                    except Exception:
+                        try:
+                            self.fdtd.close()
+                        except Exception:
+                            pass
+                        self.fdtd = _open_lumerical_fdtd()
+                        self.fdtd.switchtolayout()
+                        self.fdtd.load(fsp_path)
+            raise last_error
         else:
             self.fdtd.run()
 
@@ -1375,12 +1420,13 @@ class LumericalOptimizationProblem:
         self.g_norm=np.zeros(len(self.objective_functions))
         self.current_state = "INIT"
         self.sim_copy=self.sim
+        self.base_fsp_path = os.path.abspath(f"base_{self.opt_idx}.fsp")
         self.sim.fdtd.switchtolayout()
-        self.sim.fdtd.save(f"base_{self.opt_idx}.fsp")
+        self.sim.fdtd.save(self.base_fsp_path)
         self.sim.fdtd.close()
         self.sim.fdtd = _open_lumerical_fdtd()
         self.sim.fdtd.switchtolayout()
-        self.sim.fdtd.load(f"base_{self.opt_idx}.fsp")
+        self.sim.fdtd.load(self.base_fsp_path)
 
 
 
@@ -1444,7 +1490,7 @@ class LumericalOptimizationProblem:
             self.sim.fdtd = self.sim_copy
             self.sim.fdtd = _open_lumerical_fdtd()
             self.sim.fdtd.switchtolayout()
-            self.sim.fdtd.load(f"base_{self.opt_idx}.fsp")
+            self.sim.fdtd.load(self.base_fsp_path)
             self.rs_cnt+=1
         else:
             self.rs_cnt+=1
@@ -1556,41 +1602,71 @@ class LumericalOptimizationProblem:
 
     """ Forward run"""
     def forward_run(self):
-        self.sim.fdtd.switchtolayout()
-        self.sim.fdtd.setnamed('source', 'enabled', True)
-        self.sim.fdtd.setnamed('design_monitor', 'enabled', True)
-        self.sim.fdtd.setnamed('FoM_monitor', 'enabled', True)
         self.iter += 1
 
-        self.sim.run(name="Forward_run", save=True)
-        try:
-            self.forward_fields = self.get_field(
-                self.sim.design_monitor_name,
-                H_field=False,
-                check_design_alignment=True,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Forward session run finished without readable E result on "
-                f"{self.sim.design_monitor_name}. This usually means the Lumerical "
-                "session resource did not actually run the saved project. External solver "
-                "fallback is disabled. Check LUMERICAL_SESSION_RESOURCE_NAME and "
-                "the active GPU resource in Lumerical Resource Manager."
-            ) from exc
-        spec = self.sim.fdtd.getresult("source", "spectrum")
+        retries = max(1, int(os.environ.get("LUMERICAL_FORWARD_RESULT_RETRIES", "3")))
+        retry_delay = float(os.environ.get("LUMERICAL_FORWARD_RESULT_RETRY_DELAY", "10"))
+        last_error = None
+        for attempt in range(retries):
+            self.sim.fdtd.switchtolayout()
+            self.sim.fdtd.setnamed('source', 'enabled', True)
+            self.sim.fdtd.setnamed('design_monitor', 'enabled', True)
+            self.sim.fdtd.setnamed('FoM_monitor', 'enabled', True)
 
-        self.src_freqs = np.array(spec["f"]).reshape(-1)
-        self.src_spectrum = np.array(spec["spectrum"]).reshape(-1)
+            try:
+                self.sim.run(name="Forward_run", save=True)
+                self.forward_fields = self.get_field(
+                    self.sim.design_monitor_name,
+                    H_field=False,
+                    check_design_alignment=True,
+                )
+                spec = self.sim.fdtd.getresult("source", "spectrum")
 
-        self.FoM_fields = self.get_field("FoM_monitor", H_field=self.H_field)
+                self.src_freqs = np.array(spec["f"]).reshape(-1)
+                self.src_spectrum = np.array(spec["spectrum"]).reshape(-1)
 
-        Eres = self.sim.fdtd.getresult("FoM_monitor", "E")
-        self.xg = np.atleast_1d(np.squeeze(np.array(Eres["x"])))
-        self.yg = np.atleast_1d(np.squeeze(np.array(Eres["y"])))
-        self.zg = np.atleast_1d(np.squeeze(np.array(Eres["z"])))
+                self.FoM_fields = self.get_field("FoM_monitor", H_field=self.H_field)
 
-        self.dt = float(np.squeeze(np.array(self.sim.fdtd.getresult("source", "dt"))))
-        self.time_sn = ((np.array(self.sim.fdtd.getresult("source", "time_signal"))))
+                Eres = self.sim.fdtd.getresult("FoM_monitor", "E")
+                self.xg = np.atleast_1d(np.squeeze(np.array(Eres["x"])))
+                self.yg = np.atleast_1d(np.squeeze(np.array(Eres["y"])))
+                self.zg = np.atleast_1d(np.squeeze(np.array(Eres["z"])))
+
+                self.dt = float(np.squeeze(np.array(self.sim.fdtd.getresult("source", "dt"))))
+                self.time_sn = ((np.array(self.sim.fdtd.getresult("source", "time_signal"))))
+                break
+            except Exception as exc:
+                last_error = exc
+                log_tail = self.sim._run_log_tail("Forward_run")
+                if attempt >= retries - 1:
+                    raise RuntimeError(
+                        "Forward session run finished without readable monitor results. "
+                        f"Missing/failed provider: {self.sim.design_monitor_name} or FoM_monitor. "
+                        "The saved FDTD run log often contains the real solver-side cause. "
+                        "External solver fallback is disabled. Check GPU availability with "
+                        "`resource` and use a GPU with no active jobs. "
+                        f"Last Python error: {exc}\n"
+                        f"Forward_run_p0.log tail:\n{log_tail}"
+                    ) from exc
+                print(
+                    "Forward session run returned without readable monitor results; "
+                    f"retrying in {retry_delay:g}s ({attempt + 1}/{retries - 1}). "
+                    f"Last error: {exc}"
+                )
+                if log_tail:
+                    print(f"Forward_run_p0.log tail:\n{log_tail}")
+                time.sleep(retry_delay)
+                try:
+                    self.sim.fdtd.switchtolayout()
+                    self.sim.fdtd.load(getattr(self.sim, "_last_run_fsp_path", os.path.abspath("Forward_run.fsp")))
+                except Exception:
+                    try:
+                        self.sim.fdtd.close()
+                    except Exception:
+                        pass
+                    self.sim.fdtd = _open_lumerical_fdtd()
+                    self.sim.fdtd.switchtolayout()
+                    self.sim.fdtd.load(getattr(self.sim, "_last_run_fsp_path", os.path.abspath("Forward_run.fsp")))
         self.sim.fdtd.switchtolayout()
         self.sim.fdtd.setnamed('design_monitor', 'enabled', False)
         self.sim.fdtd.setnamed('FoM_monitor', 'enabled', False)

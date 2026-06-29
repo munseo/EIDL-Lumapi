@@ -50,7 +50,7 @@ for seq in [0]:
     if Capsulation:
         Geometry_profile = True
         Wavelengths = 1.55  # um
-        mode = [1, 3]       # target Lumerical mode numbers
+        mode = [3, 1]       # target Lumerical mode numbers
         Target_band = 1
 
         Main_Parameters = True
@@ -63,8 +63,8 @@ for seq in [0]:
             resolution = 50
 
             design_region_x = round(0.3, 2)
-            design_region_y = round(6.0, 2)
-            design_region_z = round(10.0, 2)
+            design_region_y = round(8.0, 2)
+            design_region_z = round(8.0, 2)
             design_region_resolution = int(resolution)
 
             SiO2_h = round(0.65, 2)
@@ -79,8 +79,8 @@ for seq in [0]:
 
         if Parameter_activation:
             Lpml = round(10.0 / resolution, 2)
-            waveguide_length_I = round(0.5, 2)
-            waveguide_length_O = round(0.5, 2)
+            waveguide_length_I = round(1.0, 2)
+            waveguide_length_O = round(1.0, 2)
             pml_2_src = round(2.0 / resolution, 2)
             mon_2_pml = round(2.0 / resolution, 2)
 
@@ -478,7 +478,7 @@ for seq in [0]:
         x0 = np.ones((n,)) * 0.5
         dJ_0 = np.zeros((n * Nx,))
 
-        My_opt = ms.Opt_MS2.OPT_Ms(x0, dJ_0, Born_k=99)
+        My_opt = ms.Opt_MS2.OPT_Ms(x0, dJ_0, Born_k=50)
         My_opt.flag = True
         My_opt(mapping, N_fom, Adjoint_loop)
 
