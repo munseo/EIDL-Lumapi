@@ -37,6 +37,86 @@ def tanh_projection_m(x: np.ndarray, beta: float, eta: float) -> np.ndarray:
             return npa.where(x < eta, (LR + npa.tanh(beta*(x-eta)))/(2*LR), (HR + npa.tanh(beta*(x-eta)))/(2*HR))
 
 
+def rotated_rectangle_mask_2d(
+    axis_1,
+    axis_2,
+    span_1,
+    span_2,
+    rotation_deg=0.0,
+    center_1=0.0,
+    center_2=0.0,
+):
+    """Return a boolean mask for a rotated rectangle on a 2D Cartesian grid.
+
+    ``axis_1`` and ``axis_2`` are one-dimensional coordinate arrays.  The
+    rotation convention matches a Lumerical rectangle rotated about the
+    remaining orthogonal axis: global coordinates are inverse-rotated into the
+    rectangle's local frame before applying the two span bounds.
+    """
+    axis_1 = np.asarray(axis_1, dtype=float).reshape(-1)
+    axis_2 = np.asarray(axis_2, dtype=float).reshape(-1)
+    span_1 = float(span_1)
+    span_2 = float(span_2)
+    if axis_1.size < 1 or axis_2.size < 1:
+        raise ValueError("rotated rectangle mask requires non-empty coordinate axes")
+    if span_1 <= 0.0 or span_2 <= 0.0:
+        raise ValueError("rotated rectangle spans must be positive")
+
+    grid_1, grid_2 = np.meshgrid(axis_1, axis_2, indexing="ij")
+    delta_1 = grid_1 - float(center_1)
+    delta_2 = grid_2 - float(center_2)
+    angle = np.deg2rad(float(rotation_deg))
+    cos_a, sin_a = float(np.cos(angle)), float(np.sin(angle))
+    local_1 = cos_a * delta_1 + sin_a * delta_2
+    local_2 = -sin_a * delta_1 + cos_a * delta_2
+    tol = 32.0 * np.finfo(float).eps * max(span_1, span_2, 1.0)
+    return (
+        (np.abs(local_1) <= 0.5 * span_1 + tol)
+        & (np.abs(local_2) <= 0.5 * span_2 + tol)
+    )
+
+
+def apply_fixed_material_masks(density, one_mask=None, zero_mask=None):
+    """Apply exact differentiable material masks to a flattened density.
+
+    The operation is intentionally applied *after* fabrication filtering and
+    projection.  Consequently masked cells remain exactly binary and autograd
+    returns zero derivative there.  Fixed-high and fixed-low masks must be
+    disjoint: silently assigning precedence would make it impossible for both
+    material-mask contracts to remain true.
+    """
+    result = npa.reshape(density, (-1,))
+    one_mask = (
+        None if one_mask is None else np.asarray(one_mask, dtype=bool).reshape(-1)
+    )
+    zero_mask = (
+        None if zero_mask is None else np.asarray(zero_mask, dtype=bool).reshape(-1)
+    )
+    if one_mask is not None and zero_mask is not None:
+        if one_mask.size != zero_mask.size:
+            raise ValueError(
+                "fixed one/zero masks must have the same number of cells: "
+                f"{one_mask.size} != {zero_mask.size}"
+            )
+        overlap = int(np.count_nonzero(one_mask & zero_mask))
+        if overlap:
+            raise ValueError(
+                "fixed one/zero masks must be disjoint; "
+                f"found {overlap} overlapping cells"
+            )
+    expected_size = (
+        one_mask.size if one_mask is not None
+        else zero_mask.size if zero_mask is not None
+        else result.size
+    )
+    result = npa.reshape(result, (expected_size,))
+    if one_mask is not None:
+        result = npa.where(one_mask, 1.0, result)
+    if zero_mask is not None:
+        result = npa.where(zero_mask, 0.0, result)
+    return npa.reshape(result, (-1,))
+
+
 def radial_cross_section_to_3d(
     x,
     DR_width,
@@ -219,7 +299,24 @@ def get_reference_layer(#-- Input parameters ---------------------|
     #                                                             |
     beta,     # Binrization parameter                             |
     Mask_pixels, # Number of pixels for mask region               |
+    Fixed_one_mask=None, # Exact material-1 mask for custom waveguides |
+    Fixed_zero_mask=None, # Exact material-0 mask (applied last)       |
 ):                                                                #-- Impose MFS and MGS on x ------------------------|
+    has_custom_waveguide_masks = (
+        Fixed_one_mask is not None or Fixed_zero_mask is not None
+    )
+    if has_custom_waveguide_masks and not Is_waveguide:
+        raise ValueError("custom fixed waveguide masks require Is_waveguide=True")
+    expected_mask_size = N_width * N_length
+    for mask_name, mask in (
+        ("Fixed_one_mask", Fixed_one_mask),
+        ("Fixed_zero_mask", Fixed_zero_mask),
+    ):
+        if mask is not None and np.asarray(mask).size != expected_mask_size:
+            raise ValueError(
+                f"{mask_name} must contain {expected_mask_size} cells, "
+                f"got {np.asarray(mask).size}"
+            )
     eta_Ref = 0.05                                                      # Thresholding point of tanh projection       |
     Single_pixel= round(1/DR_res,3)                                                          #                        |
     Total_R = get_conic_radius(Min_size_top+ Min_gap, 1-eta_Ref)                             # Radius for MFS + MGS   |
@@ -298,7 +395,7 @@ def get_reference_layer(#-- Input parameters ---------------------|
         | (L_g >= L_g[:,N_length-1-Mask_pixels])                                             #                        |
     )                                                                                        #------------------------|
     Air_mask = border_mask.copy()                                                            # Mask ------------------|
-    if Is_waveguide: #-----------------------------------------------------------------------# Define the mask region |
+    if Is_waveguide and not has_custom_waveguide_masks: #-------------------------------# Legacy straight ports |
         Mask_sz_ii = round(0.5*(input_w_top)/Single_pixel)                                   # Core mask -------------|
         Mask_sz_io = round(0.5*(w_top)/Single_pixel)                                         #                        |
         down_wg_mask_init= (                                                                 #                        |
@@ -313,6 +410,12 @@ def get_reference_layer(#-- Input parameters ---------------------|
         Air_mask[Li_mask_init] = False                                                       #                        |
     #-----------------------------------------------------------------------------------------------------------------|
     x_ref = npa.reshape(x,(N_width,N_length))  # Reshape for flip ----------------------------------------------------|
+    x_ref = x_ref.flatten()                                                                  #                        |
+    if Is_waveguide and not has_custom_waveguide_masks:                                      # Legacy masking     ----|
+        x_ref = npa.where(Li_mask_init.flatten(), 1, npa.where(Air_mask.flatten(), 0, x_ref))#                        |
+    else:                                                                                    #                        |
+        x_ref = npa.where(Air_mask.flatten(), 0, x_ref)                                      #                        |
+    x_ref = npa.reshape(x_ref,(N_width,N_length))  # Reshape for flip ----------------------------------------------------|
     if Width_symmetry:                                                                       # Width Mirror ----------|
         if Symmetry_in_Sim:                                                                  #   Y Mirror Sim Case    |
             print('Gradient has Width symmetry')                                             #                        |
@@ -338,11 +441,7 @@ def get_reference_layer(#-- Input parameters ---------------------|
         x_ref = (npa.fliplr(x_ref) + x_ref)/2
         x_ref = (npa.flipud(x_ref) + x_ref)/2
         x_ref = (x_ref.transpose() + x_ref)/2
-    x_ref = x_ref.flatten()                                                                  #                        |
-    if Is_waveguide:                                                                         # Masking            ----|
-        x_ref = npa.where(Li_mask_init.flatten(), 1, npa.where(Air_mask.flatten(), 0, x_ref))#                        |
-    else:                                                                                    #                        |
-        x_ref = npa.where(Air_mask.flatten(), 0, x_ref)                                      #                        |
+    x_ref = x_ref.flatten()
     #-----------------------------------------------------------------------------------------------------------------|
     x_copy = tanh_projection_m(x_ref, beta, 0.5)                                            # Binarization ----------|
     # x_copy = tanh_projection_m(x_copy, beta, -0.5)                                           # Binarization ----------|
@@ -374,6 +473,14 @@ def get_reference_layer(#-- Input parameters ---------------------|
     if Air_pad > 0:                                                                                               #   |
         x_copy= x_copy[Air_pad:(N_width-Air_pad),Air_pad:(N_length-Air_pad)]                                      #   |
     x_copy = x_copy.flatten()                                                                                     #   |
+    if Is_waveguide and has_custom_waveguide_masks:
+        # Apply custom CAD-aligned masks after all filtering/projection.  Fixed
+        # cells remain exact and have zero autograd derivative; zero wins overlap.
+        x_copy = apply_fixed_material_masks(
+            x_copy,
+            one_mask=Fixed_one_mask,
+            zero_mask=Fixed_zero_mask,
+        )
     del x_ref                                     # Clear Memory -----------------------------------------------------|
     return x_copy                                                                                # Reference layer ---|
 #---------------------------------------------------------------------------------------------------------------------|

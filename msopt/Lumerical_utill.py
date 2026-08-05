@@ -1190,6 +1190,13 @@ class LumericalFDTDSimulator:
     def _configured_session_resource_names(self, resource_type="GPU"):
         names = []
         config_paths = []
+        xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config_home:
+            config_paths.append(
+                Path(xdg_config_home).expanduser()
+                / "Lumerical"
+                / "FDTD Solutions.ini"
+            )
         for home_value in (os.environ.get("HOME"), os.environ.get("EIDL_REAL_HOME")):
             if home_value:
                 config_paths.append(Path(home_value).expanduser() / ".config" / "Lumerical" / "FDTD Solutions.ini")
@@ -1389,6 +1396,7 @@ class LumericalOptimizationProblem:
         self.adjoint_fields = None
         self.FoM_fields = None
         self.last_forward_had_nonfinite = False
+        self.forward_result_hook = None
         self.src_spectrum = None 
         self.iter=0
         self.rs_cnt=1
@@ -1604,7 +1612,7 @@ class LumericalOptimizationProblem:
     def forward_run(self):
         self.iter += 1
 
-        retries = max(1, int(os.environ.get("LUMERICAL_FORWARD_RESULT_RETRIES", "3")))
+        retries = max(1, int(os.environ.get("LUMERICAL_FORWARD_RESULT_RETRIES", "6")))
         retry_delay = float(os.environ.get("LUMERICAL_FORWARD_RESULT_RETRY_DELAY", "10"))
         last_error = None
         for attempt in range(retries):
@@ -1620,10 +1628,18 @@ class LumericalOptimizationProblem:
                     H_field=False,
                     check_design_alignment=True,
                 )
-                spec = self.sim.fdtd.getresult("source", "spectrum")
-
-                self.src_freqs = np.array(spec["f"]).reshape(-1)
-                self.src_spectrum = np.array(spec["spectrum"]).reshape(-1)
+                try:
+                    spec = self.sim.fdtd.getresult("source", "spectrum")
+                    self.src_freqs = np.asarray(spec["f"], dtype=float).reshape(-1)
+                    self.src_spectrum = np.asarray(spec["spectrum"], dtype=float).reshape(-1)
+                except Exception:
+                    wl = np.asarray(getattr(self.sim, "src_wl", []), dtype=float).reshape(-1)
+                    if wl.size:
+                        c = getattr(self.sim, "c", 299792458.0)
+                        self.src_freqs = np.asarray(c / wl, dtype=float).reshape(-1)
+                    else:
+                        self.src_freqs = np.asarray([float(getattr(self.sim, "center_wl", 0.0))], dtype=float)
+                    self.src_spectrum = np.ones_like(self.src_freqs, dtype=float)
 
                 self.FoM_fields = self.get_field("FoM_monitor", H_field=self.H_field)
 
@@ -1632,8 +1648,14 @@ class LumericalOptimizationProblem:
                 self.yg = np.atleast_1d(np.squeeze(np.array(Eres["y"])))
                 self.zg = np.atleast_1d(np.squeeze(np.array(Eres["z"])))
 
-                self.dt = float(np.squeeze(np.array(self.sim.fdtd.getresult("source", "dt"))))
-                self.time_sn = ((np.array(self.sim.fdtd.getresult("source", "time_signal"))))
+                try:
+                    self.dt = float(np.squeeze(np.array(self.sim.fdtd.getresult("source", "dt"))))
+                    self.time_sn = np.asarray(self.sim.fdtd.getresult("source", "time_signal"))
+                except Exception:
+                    self.dt = 1.0
+                    self.time_sn = np.zeros_like(self.src_freqs, dtype=float)
+                if self.forward_result_hook is not None:
+                    self.forward_result_hook(self)
                 break
             except Exception as exc:
                 last_error = exc
@@ -1673,6 +1695,7 @@ class LumericalOptimizationProblem:
         self.sim.fdtd.setnamed('source', 'enabled', False)
 
         args = []
+
         self.last_forward_had_nonfinite = False
         for arg in self.objective_arguments:
             field_arg = np.asarray(self.FoM_fields[arg], dtype=np.complex128)
@@ -1699,9 +1722,70 @@ class LumericalOptimizationProblem:
         ]
         self.current_state = "FWD"
 
+    def _run_adjoint_with_result_retry(self, source_name):
+        """Run one adjoint solve and require a readable design-monitor result.
+
+        A session solve can return normally even when the external engine failed
+        to acquire an HPC license. In that case no monitor result exists. The
+        forward path retries this condition; adjoint solves must do the same.
+        """
+        retries = max(1, int(os.environ.get("LUMERICAL_ADJOINT_RESULT_RETRIES", "6")))
+        retry_delay = float(
+            os.environ.get("LUMERICAL_ADJOINT_RESULT_RETRY_DELAY", "10")
+        )
+        last_error = None
+        for attempt in range(retries):
+            self.sim.fdtd.switchtolayout()
+            self.sim.fdtd.setnamed(source_name, "enabled", True)
+            self.sim.fdtd.setnamed("design_monitor", "enabled", True)
+            try:
+                self.sim.run(name="Adjoint_run", save=True)
+                return self.get_field(
+                    self.sim.design_monitor_name,
+                    H_field=False,
+                    check_design_alignment=True,
+                )
+            except Exception as exc:
+                last_error = exc
+                log_tail = self.sim._run_log_tail("Adjoint_run")
+                if attempt >= retries - 1:
+                    raise RuntimeError(
+                        "Adjoint session run finished without readable design-monitor "
+                        f"results after {retries} attempt(s). "
+                        "The saved FDTD log often contains the solver-side cause. "
+                        f"Last Python error: {exc}\n"
+                        f"Adjoint_run_p0.log tail:\n{log_tail}"
+                    ) from exc
+                print(
+                    "Adjoint session run returned without readable monitor results; "
+                    f"retrying in {retry_delay:g}s ({attempt + 1}/{retries - 1}). "
+                    f"Last error: {exc}"
+                )
+                if log_tail:
+                    print(f"Adjoint_run_p0.log tail:\n{log_tail}")
+                time.sleep(retry_delay)
+                fsp_path = getattr(
+                    self.sim,
+                    "_last_run_fsp_path",
+                    os.path.abspath("Adjoint_run.fsp"),
+                )
+                try:
+                    self.sim.fdtd.switchtolayout()
+                    self.sim.fdtd.load(fsp_path)
+                except Exception:
+                    try:
+                        self.sim.fdtd.close()
+                    except Exception:
+                        pass
+                    self.sim.fdtd = _open_lumerical_fdtd()
+                    self.sim.fdtd.switchtolayout()
+                    self.sim.fdtd.load(fsp_path)
+        raise last_error
+
 
     """ Adjoint source update"""
     def update_adjoint_dipole(self, dJ):
+        self._adjoint_source_inserted = False
         self.adj_wl = self.sim.src_wl
         self.adj_bw = self.sim.src_bw
 
@@ -1809,8 +1893,10 @@ class LumericalOptimizationProblem:
                 self.sim.fdtd.eval('field.addattribute("H",Hx,Hy,Hz);')
             self.sim.fdtd.eval('importdataset(field);')
             self.sim.fdtd.setnamed("adjoint_source", "enabled", False)
+            self._adjoint_source_inserted = True
             return
 
+        inserted_any = False
         for iidx in range(len(self.adj_wl)):
             self.sim.fdtd.addimportedsource()
             self.sim.fdtd.set("name", f"adjoint_source_{iidx}")
@@ -1882,6 +1968,8 @@ class LumericalOptimizationProblem:
             self.sim.fdtd.eval('importdataset(field);')
             # self.sim.fdtd.set('optimize for short pulse', False)
             self.sim.fdtd.setnamed(f"adjoint_source_{iidx}", "enabled", False)
+            inserted_any = True
+        self._adjoint_source_inserted = inserted_any
 
     """ Adjoint run"""
     def adjoint_dipole_run(self):
@@ -1906,29 +1994,30 @@ class LumericalOptimizationProblem:
 
         self.sim.fdtd.switchtolayout()
         self.sim.fdtd.setnamed('FoM_monitor', 'enabled', False)
-        self.sim.fdtd.setnamed('design_monitor', 'enabled', True)
         d_arr = time.time()
         self.adjoint_fields = np.zeros_like(self.forward_fields, dtype=np.complex128)
+        if not getattr(self, "_adjoint_source_inserted", False):
+            self.sim.fdtd.setnamed('design_monitor', 'enabled', False)
+            self.current_state = "Adj"
+            print("[adjoint_dipole_run] zero adjoint source; using zero adjoint fields.")
+            print(f"Jacobian time: {Jacob - start:.2f} seconds")
+            print(f"Source insertion time: {d_arr - Jacob:.2f} seconds")
+            print("Adjoint run time: 0.00 seconds")
+            return
+
+        self.sim.fdtd.setnamed('design_monitor', 'enabled', True)
 
         if self.broadband_adjoint and len(self.adj_wl) > 1:
-            self.sim.fdtd.setnamed("adjoint_source", 'enabled', True)
-            self.sim.run(name="Adjoint_run", save=True)
-            adj_res = self.get_field(
-                self.sim.design_monitor_name,
-                H_field=False,
-                check_design_alignment=True,
+            adj_res = self._run_adjoint_with_result_retry(
+                source_name="adjoint_source",
             )
             self.adjoint_fields = adj_res
             self.sim.fdtd.switchtolayout()
             self.sim.fdtd.eval('select("adjoint_source"); delete;')
         else:
             for iidx in range(len(self.adj_wl)):
-                self.sim.fdtd.setnamed(f"adjoint_source_{iidx}", 'enabled', True)
-                self.sim.run(name="Adjoint_run", save=True)
-                adj_res = self.get_field(
-                    self.sim.design_monitor_name,
-                    H_field=False,
-                    check_design_alignment=True,
+                adj_res = self._run_adjoint_with_result_retry(
+                    source_name=f"adjoint_source_{iidx}",
                 )
                 self.adjoint_fields[:, :, :, :, iidx] = adj_res[:, :, :, :, iidx]
                 self.sim.fdtd.switchtolayout()

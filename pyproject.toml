@@ -26,6 +26,7 @@ dependencies = [
 [project.scripts]
 resource = "msopt.cli.resource:main"
 run = "msopt.cli.run:main"
+runbg = "msopt.cli.runbg:main"
 
 [tool.setuptools]
 packages = ["msopt", "msopt.cli"]

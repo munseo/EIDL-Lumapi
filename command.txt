@@ -12,6 +12,10 @@ resource
 
 # Run a Lumerical simulation script.
 run script_name.py -th 8 -GPU 2
+# If that GPU has active jobs, run still starts when GPU utilization is below 40%.
+
+# Run detached from the current terminal/SSH session.
+runbg script_name.py -th 8 -GPU 2
 
 # Run with resource profiling.
 run script_name.py -th 8 -GPU 2 --profile

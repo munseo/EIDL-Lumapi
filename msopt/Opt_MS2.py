@@ -353,10 +353,10 @@ class OPT_Ms:
             np.savetxt(f"{self.local_best_dir}ref_layer_{self.Best[7]}.txt", self.Best[1])
             np.savetxt(f"{self.local_best_dir}param_{self.Best[7]}.txt", [self.Best[4], self.Best[5], self.Best[0]])
             self.Updater(is_Worst= True)
-            if self.Outer_M[2] >= 0.5 or self.Outer_M[2] < 0.05:
+            if self.Outer_M[2] < 0.5:
                 self.beta_scale = 0.5 # 150%
             else:
-                self.beta_scale = self.Outer_M[2]*1.5 # 200%
+                self.beta_scale = self.Outer_M[2]*1.0 # 200%
             self.Array[4] *= (1.0 + self.beta_scale)
             self.P_history= [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
             if self.Best[4] > 25 and self.Outer_M[2] >= 0.95 or self.Is_gray: 
@@ -804,6 +804,7 @@ class Mapping:
         Is_freeform=[False, False, False], # Is Free-form?, Is gray-scale?, Is Single layer?
         Is_slanted_grating=False,
         Is_radial_3d=None,
+        Fixed_waveguide_masks=None,
     ):
         self.MFS = MFS
         self.MFS0 =MFS
@@ -824,6 +825,26 @@ class Mapping:
         self.Is_1D_grating = Is_1D_grating
         self.Is_Cylindrical= Is_Cylindrical
         self.Is_radial_3d = Is_radial_3d
+        self.Fixed_waveguide_one_mask = None
+        self.Fixed_waveguide_zero_mask = None
+        if Fixed_waveguide_masks is not None:
+            if not Is_waveguide[0]:
+                raise ValueError(
+                    "Fixed_waveguide_masks requires Is_waveguide[0]=True"
+                )
+            if not isinstance(Fixed_waveguide_masks, dict):
+                raise TypeError(
+                    "Fixed_waveguide_masks must be a dict with 'one' and/or 'zero'"
+                )
+            self.Fixed_waveguide_one_mask = Fixed_waveguide_masks.get("one")
+            self.Fixed_waveguide_zero_mask = Fixed_waveguide_masks.get("zero")
+            if (
+                self.Fixed_waveguide_one_mask is None
+                and self.Fixed_waveguide_zero_mask is None
+            ):
+                raise ValueError(
+                    "Fixed_waveguide_masks must define 'one' and/or 'zero'"
+                )
         self.radial_3d_enabled = False
         self.radial_3d_apply_filter = True
         self.radial_3d_radius = None
@@ -832,6 +853,7 @@ class Mapping:
         self.radial_3d_vertical_grating = False
         self.slanted= Is_slanted_grating
         self.N_height=DR_N_info[DR_info[5]]
+        self.need_T = True
         if isinstance(Is_radial_3d, dict):
             self.radial_3d_enabled = bool(Is_radial_3d.get("enabled", False))
             self.N_radius = Is_radial_3d.get("N_radius", None)
@@ -861,6 +883,8 @@ class Mapping:
         elif DR_info[3] >= DR_info[4] and DR_info[3] !=2:
             raise ValueError("Design layer width axis should be low axis")
         else: # width axis < length axis && layer size = width*length
+            if DR_info[5] == 0:
+                self.need_T = False
             if Is_waveguide[0]:            
                 if Is_waveguide[1]:
                     self.MGS0= MGS*0.5
@@ -884,6 +908,18 @@ class Mapping:
                 self.N_width =DR_N_info[DR_info[3]]
                 self.Mask_info[0]=0
                 self.Mask_info[1]=0
+        if Fixed_waveguide_masks is not None:
+            expected_mask_size = self.N_width * self.N_length
+            for mask_name, mask in (
+                ("one", self.Fixed_waveguide_one_mask),
+                ("zero", self.Fixed_waveguide_zero_mask),
+            ):
+                if mask is not None and np.asarray(mask).size != expected_mask_size:
+                    raise ValueError(
+                        "Fixed_waveguide_masks['"
+                        f"{mask_name}'] must contain {expected_mask_size} cells, "
+                        f"got {np.asarray(mask).size}"
+                    )
         if self.radial_3d_enabled:
             if self.radial_3d_radius is None:
                 self.radial_3d_radius = 0.5 * min(self.DR_width, self.DR_length)
@@ -903,6 +939,8 @@ class Mapping:
                 f"{self.parameter_shape} -> xyz {self.output_shape}, "
                 f"R={self.radial_3d_radius}"
             )
+        # else:
+        # self.parameter_count = self.N_width * self.N_length * self.N_height
     
     def __call__(
         self,
@@ -1029,6 +1067,8 @@ class Mapping:
                         Min_gap=self.MGS0,
                         beta= beta,
                         x = x,
+                        Fixed_one_mask=self.Fixed_waveguide_one_mask,
+                        Fixed_zero_mask=self.Fixed_waveguide_zero_mask,
                     )
                     if self.Is_waveguide[2]:# Slanted Waveguide
                         x_copy= Sub_Mapping.Slant_sidewall(
@@ -1060,7 +1100,8 @@ class Mapping:
                                 Reference_layer = x_copy,
                                 N_height = self.N_height,
                             )
-                        x_copy = npa.reshape(x_copy,(self.N_height,self.N_width*self.N_length)).transpose()
+                        if self.need_T:
+                            x_copy = npa.reshape(x_copy,(self.N_height,self.N_width*self.N_length)).transpose()
         else: # 2D -> 3D projection of optimized reference layer
             if self.radial_3d_enabled:
                 return Sub_Mapping.radial_cross_section_to_3d(

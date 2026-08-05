@@ -1,748 +1,404 @@
-import csv
+"""Representative-single-dipole OLED outcoupling optimization (radial 3-D design).
+
+Each of the N_fom channels is ONE x-polarized dipole at a representative radial
+position in the EML plane; channel FoMs are combined by a NORMALIZED WEIGHTED
+SUM (not mean).  Compact rewrite of legacy_20260731/OLED_lens.py on top of
+oled_common; all MSOPT_* environment variables keep working.
+
+The ONE intended behavior change vs the legacy script: the FoM angle basis is
+now the shared 2-D k-ring ramp basis from oled_common (MSOPT_OLED_FOM_MODE,
+default "kspace_2d") instead of the legacy 1-D phi=0 line basis.  The 1-D
+basis only saw the (m,0) diffraction orders and was blind to the off-axis
+(m,n) orders, which let ~50% of the power leak above 50 deg in the archived
+runs.
+"""
+
 import os
 import time
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 import msopt as ms
+import oled_common as oc
+
+npa = oc.npa
+ag_jacobian = oc.ag_jacobian
+
+# =============================================================================
+# Run switches -- edit these, no environment variables needed
+# =============================================================================
+# Values here are exported as environment DEFAULTS, so an explicitly set
+# MSOPT_OLED_* still wins (sweeps keep working without touching this file).
+#
+#   RUN_OPTIMIZATION  False -> skip the optimizer and only run the postprocess
+#   PLANAR_PP         True  -> discard the design and characterize the BARE stack
+#                              ("low" = design region filled with air, i.e. nothing
+#                               on top; "high" = a flat slab of design material,
+#                               which isolates PATTERNING from the layer's presence)
+#   PP_MODE           "supercell" (NxN tiles, the validated protocol) or "single"
+#                              (1 cell + pad; cheap and correct for a planar stack)
+#   PP_DIPOLE_GRID    NxN incoherent dipole grid; 1 is exact for a planar stack
+#   PP_CAPTURE_DEG    the domain is widened until this polar angle still reaches
+#                              the monitor -- light past it is eaten by the lateral
+#                              PML and is MISSING from the near2far input
+#   PP_KEEP_FSP       keep every run's .fsp (hundreds of MB each)
+#   RESOLUTION        cells/um for the simulation AND the design grid (locked
+#                              together by msopt). Layers thinner than 1/RESOLUTION
+#                              still get resolved: add_stack adds a z-only mesh
+#                              override derived from the stack's thinnest layer.
+#   DESIGN_H_UM       design-region thickness
+#   DESIGN_X/Y_UM     design footprint; None = the full period
+#   DESIGN_N          design-region index at rho=1 (rho=0 is DESIGN_LOW_N).
+#                              1.45 suits the legacy stack; on the microcavity the
+#                              design sits on an n=2.2 CPL, so a higher DESIGN_N
+#                              gives the pattern real contrast
+#   DESIGN_LOW_N      index at rho=0 (1.0 = air)
+#   PROBE_GAP_UM      source/monitor plane height above the design top
+#   TOP_MARGIN_UM     air above that plane (auto-raised to clear the PML)
+RUN_OPTIMIZATION = True
+PLANAR_PP = False
+PP_MODE = "supercell"
+PP_DIPOLE_GRID = 6
+PP_CAPTURE_DEG = 60
+PP_KEEP_FSP = False
+RESOLUTION = 50
+DESIGN_H_UM = 0.30
+DESIGN_X_UM = None
+DESIGN_Y_UM = None
+DESIGN_N = 2.2
+DESIGN_LOW_N = 1.0
+PROBE_GAP_UM = 0.7
+TOP_MARGIN_UM = 0.1
+STACK = "microcavity"        # "microcavity" (optimized stack) or "legacy"
+MC_COLOR = "green"           # red / green / blue -- also sets the wavelength
+MC_STACK_KIND = "optimized"  # "optimized" (literature-derived) or "table"
+
+oc.export_run_knobs(
+    run_optimization=RUN_OPTIMIZATION, planar_pp=PLANAR_PP, pp_mode=PP_MODE,
+    pp_dipole_grid=PP_DIPOLE_GRID, pp_capture_deg=PP_CAPTURE_DEG,
+    pp_keep_fsp=PP_KEEP_FSP, resolution=RESOLUTION, design_h_um=DESIGN_H_UM,
+    design_x_um=DESIGN_X_UM, design_y_um=DESIGN_Y_UM,
+    design_n=DESIGN_N, design_low_n=DESIGN_LOW_N,
+    probe_gap_um=PROBE_GAP_UM, top_margin_um=TOP_MARGIN_UM,
+    stack=STACK, mc_color=MC_COLOR, mc_stack_kind=MC_STACK_KIND,
+)
 
 
-RUN_DIR = os.path.abspath(os.environ.get("EIDL_RUN_DIR", os.getcwd()))
-design_dir = os.path.join(RUN_DIR, "A") + os.sep
-os.makedirs(design_dir, exist_ok=True)
+G, _mc_spec = oc.select_stack(STACK, MC_COLOR, MC_STACK_KIND, period_mc=2.0)
 
+# --- Representative-dipole channels ------------------------------------------
+# Multiple dipole radii by default: a single on-axis dipole (r=0) barely excites
+# the high-angle (off-normal) diffraction orders, so the FoM was blind to the
+# leakage that off-axis dipoles dominate in the real (postprocess) device.
+# Sampling several radii -- with areal weights (~r) so the incoherent average
+# matches a uniform dipole sheet -- makes the FoM see and suppress that
+# high-angle emission.
+# How the EML is represented in the FoM.
+#   "array"          one simulation, a uniformly spaced grid of same-polarization
+#                    dipoles fired TOGETHER (OLED_new's formulation). N_fom = 1.
+#   "representative" the previous scheme: one simulation per representative radius,
+#                    each with a single dipole, combined as a weighted sum.
+#
+# WARNING, measured and documented in OLED_opt.py's header: a grid fired together
+# is a COHERENT array, and a real EML is an INCOHERENT ensemble. On the 2026-07-30
+# check against Done run 20260728_122008 the coherent 25-dipole FoM came out ~7x
+# off at 0 deg for the same design, while the reciprocal engine matched the
+# incoherent postprocess to ~0.003 in ring share. So this mode optimizes something
+# the postprocess does not measure. Kept because it is what was asked for; compare
+# against the postprocess before trusting the result.
+DIPOLE_MODE = os.environ.get("MSOPT_OLED_DIPOLE_MODE", "array").strip().lower()
+ARRAY_COUNT = oc.env_int("MSOPT_OLED_OPT_DIPOLE_COUNT", 25)
 
-def env_flag(name, default="1"):
-    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+raw_r = oc.env_list_float("MSOPT_OLED_DIPOLE_RADII_FRAC", [0.1, 0.4, 0.8])
+raw_phi = oc.env_list_float("MSOPT_OLED_DIPOLE_AZIMUTHS_DEG", [0.0])
+raw_pol = oc.env_list_str("MSOPT_OLED_DIPOLE_POLARIZATIONS", ["x"])
+raw_w = oc.env_list_float("MSOPT_OLED_DIPOLE_WEIGHTS", [1.0, 4.0, 8.0])
+N_fom = max(len(raw_r), len(raw_phi), len(raw_pol), len(raw_w))
+dipole_radii_frac = oc.broadcast(raw_r, N_fom, "MSOPT_OLED_DIPOLE_RADII_FRAC")
+dipole_azimuths_deg = oc.broadcast(raw_phi, N_fom, "MSOPT_OLED_DIPOLE_AZIMUTHS_DEG")
+dipole_polarizations = oc.broadcast(raw_pol, N_fom, "MSOPT_OLED_DIPOLE_POLARIZATIONS")
+channel_weights = np.asarray(oc.broadcast(raw_w, N_fom, "MSOPT_OLED_DIPOLE_WEIGHTS"), dtype=float)
 
-
-def env_float(name, default):
-    return float(os.environ.get(name, str(default)))
-
-
-def env_int(name, default):
-    return int(os.environ.get(name, str(default)))
-
-
-# -----------------------------------------------------------------------------
-# Image-matched OLED lens benchmark
-# -----------------------------------------------------------------------------
-wavelength_um = env_float("MSOPT_OLED_LENS_WAVELENGTH_UM", 0.55)
-resolution = env_int("MSOPT_OLED_LENS_RESOLUTION", 80)
-
-window_x = env_float("MSOPT_OLED_LENS_WINDOW_X_UM", 8.0)
-window_y = env_float("MSOPT_OLED_LENS_WINDOW_Y_UM", 8.0)
-lens_diameter = env_float("MSOPT_OLED_LENS_DIAMETER_UM", 4.0)
-lens_radius = 0.5 * lens_diameter
-lens_index = env_float("MSOPT_OLED_LENS_INDEX", 1.8)
-
-air_bot_h = 0.20
-al_h = 0.10
-tpbi_h = 0.04
-eml_h = 0.03
-tcta_h = 0.035
-ito_h = 0.10
-sio2_h = 0.10
-air_top_h = env_float("MSOPT_OLED_LENS_TOP_AIR_UM", 2.0)
-max_lens_h = env_float("MSOPT_OLED_LENS_MAX_HEIGHT_UM", 1.5)
-
-Sz = air_bot_h + al_h + tpbi_h + eml_h + tcta_h + ito_h + sio2_h + max_lens_h + air_top_h
-Z_min = -0.5 * Sz
-Z_max = 0.5 * Sz
-
-z_cursor = Z_min + air_bot_h
-al_s = [window_x, window_y, al_h]
-al_c = [0.0, 0.0, z_cursor + 0.5 * al_h]
-z_cursor += al_h
-
-tpbi_s = [window_x, window_y, tpbi_h]
-tpbi_c = [0.0, 0.0, z_cursor + 0.5 * tpbi_h]
-z_cursor += tpbi_h
-
-eml_s = [window_x, window_y, eml_h]
-eml_c = [0.0, 0.0, z_cursor + 0.5 * eml_h]
-z_cursor += eml_h
-
-tcta_s = [window_x, window_y, tcta_h]
-tcta_c = [0.0, 0.0, z_cursor + 0.5 * tcta_h]
-z_cursor += tcta_h
-
-ito_s = [window_x, window_y, ito_h]
-ito_c = [0.0, 0.0, z_cursor + 0.5 * ito_h]
-z_cursor += ito_h
-
-sio2_s = [window_x, window_y, sio2_h]
-sio2_c = [0.0, 0.0, z_cursor + 0.5 * sio2_h]
-sio2_top_z = z_cursor + sio2_h
-z_cursor += sio2_h
-
-lens_base_z = sio2_top_z
-monitor_z = min(Z_max - 0.15, lens_base_z + max_lens_h + 0.45)
-monitor_s = [window_x, window_y, 0.0]
-monitor_c = [0.0, 0.0, monitor_z]
-src_s = [window_x, window_y, 0.0]
-src_c = [0.0, 0.0, min(Z_max - 0.25, lens_base_z + max_lens_h + 0.65)]
-
-theta_channel_centers_deg = np.array([0.0, 45.0])
-target_angle_efficiency_ratio_min = np.array([1.0, 0.85], dtype=float)
-target_angle_efficiency_ratio_max = np.array([1.0, 1.0], dtype=float)
-channel_polarizations = ("x", "y")
-polarization_angles = {"x": 0.0, "y": 90.0}
-eml_component_by_polarization = {"x": "Ex", "y": "Ey"}
-target_distribution_weight = env_float("MSOPT_OLED_DISTRIBUTION_WEIGHT", 30.0)
-polarization_balance_weight = env_float("MSOPT_OLED_POL_BALANCE_WEIGHT", 10.0)
-channel_power_floor = env_float("MSOPT_OLED_CHANNEL_POWER_FLOOR", 1e-12)
-uniformity_power = env_float("MSOPT_OLED_LENS_UNIFORMITY_POWER", 1.0)
-
-
-air_index = [1.0]
-sio2_index = {
-    "name": "OLED_lens_SiO2_sampled",
-    "wavelength": [0.55],
-    "n": [1.4516],
-    "k": [0.0],
-}
-ito_index = {
-    "name": "OLED_lens_ITO_sampled",
-    "wavelength": [0.55],
-    "n": [1.94735],
-    "k": [0.0],
-}
-tcta_index = {
-    "name": "OLED_lens_TCTA_sampled",
-    "wavelength": [0.55],
-    "n": [1.791923],
-    "k": [0.0],
-}
-eml_index = {
-    "name": "OLED_lens_CBP_Irppy_sampled",
-    "wavelength": [0.55],
-    "n": [1.80128],
-    "k": [0.0],
-}
-tpbi_index = {
-    "name": "OLED_lens_TPBi_sampled",
-    "wavelength": [0.55],
-    "n": [1.75417],
-    "k": [0.0],
-}
-al_index = {
-    "name": "OLED_lens_Al_sampled",
-    "wavelength": [0.55],
-    "n": [0.811317],
-    "k": [5.79942],
-}
-
-
-def lens_height_grid():
-    values = os.environ.get("MSOPT_OLED_LENS_HEIGHTS_UM", "").strip()
-    if values:
-        return np.asarray([float(v) for v in values.replace(",", " ").split()], dtype=float)
-    h_min = env_float("MSOPT_OLED_LENS_HEIGHT_MIN_UM", 0.7)
-    h_max = env_float("MSOPT_OLED_LENS_HEIGHT_MAX_UM", 1.5)
-    n = env_int("MSOPT_OLED_LENS_HEIGHT_POINTS", 9)
-    return np.linspace(h_min, h_max, n)
-
-
-def make_target_channels():
-    channels = []
-    for angle_idx, center_deg in enumerate(theta_channel_centers_deg):
-        for pol in channel_polarizations:
-            channels.append(
-                {
-                    "name": f"theta_{center_deg:.1f}deg_{pol}",
-                    "angle_idx": angle_idx,
-                    "theta_deg": float(center_deg),
-                    "phi_deg": 0.0,
-                    "polarization": pol,
-                    "polarization_angle": polarization_angles[pol],
-                    "eml_component": eml_component_by_polarization[pol],
-                    "source_power_norm": max(float(np.cos(np.deg2rad(center_deg))), 1e-6),
-                }
-            )
-    return channels
-
-
-target_channels = make_target_channels()
-
-
-def active_pixel_mask(shape):
-    return np.ones(shape, dtype=float)
-
-
-def select_eml_component(E_x, E_y, E_z, component):
-    if component == "Ex":
-        return E_x
-    if component == "Ey":
-        return E_y
-    if component == "Ez":
-        return E_z
-    raise ValueError(f"Unknown EML component: {component}")
-
-
-def eml_component_stats(E_x, E_y, E_z, component, eps=1e-30):
-    Ei = select_eml_component(E_x, E_y, E_z, component)
-    if Ei.ndim == 4:
-        Ei = Ei[:, :, :, 0]
-    Ei = np.nan_to_num(np.asarray(Ei, dtype=np.complex128), nan=0.0, posinf=0.0, neginf=0.0)
-    mask = active_pixel_mask(Ei.shape)
-    mask_sum = max(float(np.sum(mask)), 1.0)
-    intensity = np.nan_to_num(np.abs(Ei) ** 2, nan=0.0, posinf=0.0, neginf=0.0) * mask
-    mean_intensity = float(np.sum(intensity) / mask_sum)
-    mean_intensity_sq = float(np.sum(intensity ** 2) / mask_sum)
-    uniformity = mean_intensity ** 2 / (mean_intensity_sq + eps)
-    return mean_intensity, uniformity
-
-
-def reciprocal_channel_fom(E_x, E_y, E_z, channel):
-    raw_intensity, uniformity = eml_component_stats(E_x, E_y, E_z, channel["eml_component"])
-    raw_fom = raw_intensity * (uniformity + 1e-30) ** uniformity_power
-    return max(raw_fom / channel["source_power_norm"], channel_power_floor), raw_intensity, uniformity
-
-
-def angle_powers_from_channel_values(vals):
-    vals = np.maximum(np.nan_to_num(np.asarray(vals, dtype=float), nan=0.0, posinf=0.0, neginf=0.0), channel_power_floor)
-    powers = []
-    for angle_idx in range(len(theta_channel_centers_deg)):
-        indices = [idx for idx, channel in enumerate(target_channels) if channel["angle_idx"] == angle_idx]
-        powers.append(float(np.sum(vals[indices])))
-    return np.asarray(powers, dtype=float)
-
-
-def angle_polarization_matrix(vals):
-    vals = np.maximum(np.nan_to_num(np.asarray(vals, dtype=float), nan=0.0, posinf=0.0, neginf=0.0), channel_power_floor)
-    rows = []
-    for angle_idx in range(len(theta_channel_centers_deg)):
-        row = []
-        for pol in channel_polarizations:
-            indices = [
-                idx for idx, channel in enumerate(target_channels)
-                if channel["angle_idx"] == angle_idx and channel["polarization"] == pol
-            ]
-            row.append(float(vals[indices[0]]))
-        rows.append(row)
-    return np.asarray(rows, dtype=float)
-
-
-def combine_oled_scalar_from_values(vals):
-    vals = np.maximum(np.nan_to_num(np.asarray(vals, dtype=float), nan=0.0, posinf=0.0, neginf=0.0), channel_power_floor)
-    angle_powers = angle_powers_from_channel_values(vals)
-    total_power = max(float(np.sum(angle_powers)), channel_power_floor)
-    zero_power = max(float(angle_powers[0]), channel_power_floor)
-    ratios_to_zero = angle_powers / zero_power
-    low_violation = np.maximum(target_angle_efficiency_ratio_min - ratios_to_zero, 0.0)
-    high_violation = np.maximum(ratios_to_zero - target_angle_efficiency_ratio_max, 0.0)
-    distribution_penalty = np.sum(
-        (low_violation / (target_angle_efficiency_ratio_min + 1e-30)) ** 2
-        + (high_violation / (target_angle_efficiency_ratio_max + 1e-30)) ** 2
+target_channels = []
+if DIPOLE_MODE == "array":
+    # One coherent grid per polarization -> one FoM channel per polarization.
+    _pols = list(dict.fromkeys(dipole_polarizations))
+    _gn = max(1, int(np.ceil(np.sqrt(max(1, ARRAY_COUNT)))))
+    # Sub-cell CENTRES, not linspace endpoints. The cell is periodic and
+    # active_radius equals the half-period here, so endpoints would drop dipoles
+    # exactly on the boundary where the periodic image doubles them.
+    _xs = (np.arange(_gn) + 0.5) / _gn * (2.0 * G.active_radius) - G.active_radius
+    _ys = _xs.copy()
+    for ci, pol in enumerate(_pols):
+        pts = []
+        for k in range(ARRAY_COUNT):
+            row, col = divmod(k, _gn)
+            pts.append((float(_xs[col]), float(_ys[row]), float(G.eml_c[2])))
+        target_channels.append({
+            "name": f"coherent_array_{pol}",
+            "dipole_idx": ci,
+            # centroid, so anything that still wants a single position keeps working
+            "dipole_x": float(np.mean([p[0] for p in pts])),
+            "dipole_y": float(np.mean([p[1] for p in pts])),
+            "dipole_z": float(G.eml_c[2]),
+            "dipoles": pts,
+            "polarization": pol,
+            "weight": 1.0,
+        })
+    N_fom = len(target_channels)
+    channel_weights = np.ones(N_fom, dtype=float)
+    print(f"[dipoles] COHERENT ARRAY: {ARRAY_COUNT} dipoles on a {_gn}x{_gn} grid over "
+          f"+-{G.active_radius:g} um, fired together; {N_fom} channel(s) {_pols}")
+else:
+  for i, (rf, az, pol, weight) in enumerate(zip(dipole_radii_frac, dipole_azimuths_deg, dipole_polarizations, channel_weights)):
+    a = np.deg2rad(az)
+    target_channels.append(
+        {
+            "name": f"dipole_{i}_{pol}",
+            "dipole_idx": i,
+            "dipole_x": float(rf * G.active_radius * np.cos(a)),
+            "dipole_y": float(rf * G.active_radius * np.sin(a)),
+            "dipole_z": float(G.eml_c[2]),
+            "polarization": pol,
+            "weight": float(weight),
+        }
     )
-    pol_matrix = angle_polarization_matrix(vals)
-    pol_penalty = 0.0
-    for row in pol_matrix:
-        mean_pol = max(float(np.mean(row)), channel_power_floor)
-        pol_penalty += float(np.mean(((row - mean_pol) / mean_pol) ** 2))
-    pol_penalty /= max(len(theta_channel_centers_deg), 1)
-    penalty = target_distribution_weight * distribution_penalty + polarization_balance_weight * pol_penalty
-    return total_power / (1.0 + penalty)
 
 
-def summarize_reciprocal_values(vals):
-    vals = np.maximum(np.nan_to_num(np.asarray(vals, dtype=float), nan=0.0, posinf=0.0, neginf=0.0), channel_power_floor)
-    angle_powers = angle_powers_from_channel_values(vals)
-    pol_matrix = angle_polarization_matrix(vals)
-    fractions = angle_powers / max(float(np.sum(angle_powers)), channel_power_floor)
-    ratios_to_zero = angle_powers / max(float(angle_powers[0]), channel_power_floor)
-    return angle_powers, pol_matrix, fractions, ratios_to_zero
+def combine_fom(vals):
+    # Normalized weighted SUM over channels (not the oled_common mean); also the
+    # function autograd differentiates in the adjoint_loop Case == 3 branch.
+    vals = npa.maximum(npa.where(npa.isfinite(vals), vals, 0.0), G.fom_floor)
+    weights = npa.asarray(channel_weights, dtype=float)
+    weights = weights / npa.sum(weights) if float(np.sum(channel_weights)) > 0.0 else npa.ones_like(weights) / max(float(weights.size), 1.0)
+    return npa.sum(vals * weights)
 
 
-def spherical_cap_radius(aperture_radius, height):
-    return (aperture_radius ** 2 + height ** 2) / max(2.0 * height, 1e-30)
+# --- Radial 3-D design mapping (63 x Nz parameters) --------------------------
+DR_info = [G.design_s[0], G.design_s[1], G.design_s[2], 0, 1, 2]
+DR_N_info = [G.Nx, G.Ny, G.Nz, G.resolution]
+radial_design_radius = oc.env_float("MSOPT_OLED_RADIAL_RADIUS", 0.5 * min(G.design_s[0], G.design_s[1]))
+radial_design_grids = oc.env_int("MSOPT_OLED_RADIAL_GRIDS", int(round(radial_design_radius * G.resolution)) + 1)
+mapping = None
+x0 = None
+dJ_0 = np.zeros(G.design_cells)
 
 
-def lens_profile_z(x, y, height):
-    rr = np.sqrt(x[:, None] ** 2 + y[None, :] ** 2)
-    R = spherical_cap_radius(lens_radius, height)
-    z = height - (R - np.sqrt(np.maximum(R ** 2 - rr ** 2, 0.0)))
-    return np.where(rr <= lens_radius, np.maximum(z, 0.0), 0.0)
-
-
-def add_oled_stack(sim):
-    sim.add_geo(center=al_c, size=al_s, index=al_index, name="Al_reflector", wavelength=wavelength_um)
-    sim.add_geo(center=tpbi_c, size=tpbi_s, index=tpbi_index, name="TPBi", wavelength=wavelength_um)
-    sim.add_geo(center=eml_c, size=eml_s, index=eml_index, name="CBP_Irppy_EML", wavelength=wavelength_um)
-    sim.add_geo(center=tcta_c, size=tcta_s, index=tcta_index, name="TCTA", wavelength=wavelength_um)
-    sim.add_geo(center=ito_c, size=ito_s, index=ito_index, name="ITO", wavelength=wavelength_um)
-    sim.add_geo(center=sio2_c, size=sio2_s, index=sio2_index, name="SiO2_spacer", wavelength=wavelength_um)
-
-
-def add_lens_import(sim, height, name="SiO2_lens"):
-    dx = env_float("MSOPT_OLED_LENS_IMPORT_DX_UM", 1.0 / resolution)
-    dz = env_float("MSOPT_OLED_LENS_IMPORT_DZ_UM", 1.0 / resolution)
-    nx = int(round(lens_diameter / dx)) + 1
-    ny = nx
-    nz = int(round(max(height, dz) / dz)) + 1
-    x = np.linspace(-lens_radius, lens_radius, nx) * sim.unit
-    y = np.linspace(-lens_radius, lens_radius, ny) * sim.unit
-    z = (lens_base_z + np.linspace(0.0, max(height, dz), nz)) * sim.unit
-
-    profile = lens_profile_z(x / sim.unit, y / sim.unit, height)
-    z_rel = np.linspace(0.0, max(height, dz), nz)
-    inside = z_rel[None, None, :] <= profile[:, :, None]
-    n_geo = np.ones((nx, ny, nz, 3), dtype=float)
-    n_geo[inside, :] = lens_index
-
-    sim.fdtd.putv("x_lens_geo", np.asarray(x, dtype=float))
-    sim.fdtd.putv("y_lens_geo", np.asarray(y, dtype=float))
-    sim.fdtd.putv("z_lens_geo", np.asarray(z, dtype=float))
-    sim.fdtd.putv("n_lens_geo", np.ascontiguousarray(n_geo))
-    sim.fdtd.eval(
-        f'if (getnamednumber("{name}") > 0) {{select("{name}"); delete;}}'
-        f'addimport; set("name","{name}");'
-        f'importnk2(n_lens_geo, x_lens_geo, y_lens_geo, z_lens_geo);'
-    )
-    return x / sim.unit, y / sim.unit, z / sim.unit, inside
-
-
-def add_dipole(fdtd, position, polarization):
-    x, y, z = position
-    theta, phi = {"x": (90.0, 0.0), "y": (90.0, 90.0)}[polarization]
-    fdtd.eval('if (getnamednumber("sweep_dipole") > 0) {select("sweep_dipole"); delete;}')
-    fdtd.adddipole()
-    fdtd.set("name", "sweep_dipole")
-    fdtd.set("x", x * 1e-6)
-    fdtd.set("y", y * 1e-6)
-    fdtd.set("z", z * 1e-6)
-    fdtd.set("theta", theta)
-    fdtd.set("phi", phi)
-    fdtd.set("wavelength start", wavelength_um * 1e-6)
-    fdtd.set("wavelength stop", wavelength_um * 1e-6)
-
-
-def sample_positions(n_samples):
-    nx = int(np.ceil(np.sqrt(n_samples)))
-    ny = int(np.ceil(n_samples / nx))
-    xs = np.linspace(-0.35 * lens_diameter, 0.35 * lens_diameter, nx)
-    ys = np.linspace(-0.35 * lens_diameter, 0.35 * lens_diameter, ny)
-    out = []
-    for yy in ys:
-        for xx in xs:
-            out.append((float(xx), float(yy), float(eml_c[2])))
-            if len(out) == n_samples:
-                return out
-    return out
-
-
-def get_transmission(fdtd, monitor_name):
-    try:
-        value = fdtd.transmission(monitor_name)
-        return float(np.real(np.asarray(value).reshape(-1)[0]))
-    except Exception:
-        fdtd.eval(f'_oled_lens_T = transmission("{monitor_name}");')
-        return float(np.real(np.asarray(fdtd.getv("_oled_lens_T")).reshape(-1)[0]))
-
-
-def farfield_samples(fdtd, monitor_name, angles_deg, resolution_samples):
-    try:
-        e2 = np.squeeze(np.asarray(fdtd.farfield3d(monitor_name, 1, resolution_samples, resolution_samples), dtype=float))
-        try:
-            ux = np.asarray(fdtd.farfieldux(monitor_name, 1, resolution_samples, resolution_samples), dtype=float)
-            uy = np.asarray(fdtd.farfielduy(monitor_name, 1, resolution_samples, resolution_samples), dtype=float)
-        except TypeError:
-            ux = np.asarray(fdtd.farfieldux(monitor_name, 1), dtype=float)
-            uy = np.asarray(fdtd.farfielduy(monitor_name, 1), dtype=float)
-        if ux.ndim == 1 and uy.ndim == 1:
-            ux, uy = np.meshgrid(np.ravel(ux), np.ravel(uy), indexing="ij")
-        theta = np.rad2deg(np.arcsin(np.clip(np.sqrt(ux ** 2 + uy ** 2), 0.0, 1.0)))
-        phi = np.rad2deg(np.arctan2(uy, ux))
-        out = {}
-        for angle in angles_deg:
-            if abs(float(angle)) < 1e-12:
-                metric = theta
-            else:
-                metric = np.sqrt((theta - float(angle)) ** 2 + phi ** 2)
-            idx = np.unravel_index(np.nanargmin(metric), metric.shape)
-            out[float(angle)] = float(np.real(e2[idx]))
-        return out, ""
-    except Exception as exc:
-        return {float(angle): np.nan for angle in angles_deg}, str(exc)
-
-
-def signed_theta_pattern(fdtd, monitor_name, resolution_samples):
-    angles = np.linspace(-90.0, 90.0, 181)
-    try:
-        e2 = np.squeeze(np.asarray(fdtd.farfield3d(monitor_name, 1, resolution_samples, resolution_samples), dtype=float))
-        try:
-            ux = np.asarray(fdtd.farfieldux(monitor_name, 1, resolution_samples, resolution_samples), dtype=float)
-            uy = np.asarray(fdtd.farfielduy(monitor_name, 1, resolution_samples, resolution_samples), dtype=float)
-        except TypeError:
-            ux = np.asarray(fdtd.farfieldux(monitor_name, 1), dtype=float)
-            uy = np.asarray(fdtd.farfielduy(monitor_name, 1), dtype=float)
-        if ux.ndim == 1 and uy.ndim == 1:
-            ux, uy = np.meshgrid(np.ravel(ux), np.ravel(uy), indexing="ij")
-        signed_theta = np.rad2deg(np.arcsin(np.clip(ux, -1.0, 1.0)))
-        phi0_error = np.abs(uy)
-        pattern = []
-        for angle in angles:
-            metric = np.abs(signed_theta - angle) + 1000.0 * phi0_error
-            idx = np.unravel_index(np.nanargmin(metric), metric.shape)
-            pattern.append(float(np.real(e2[idx])))
-        return angles, np.asarray(pattern, dtype=float), ""
-    except Exception as exc:
-        return angles, np.full(angles.shape, np.nan, dtype=float), str(exc)
-
-
-def build_sim(height, channel=None, top_monitor=True, eml_monitor=False):
-    sim = ms.Lumerical_utill.LumericalFDTDSimulator(
-        sim_size=[window_x, window_y, Sz],
-        resolution=resolution,
-        unit=1e-6,
-        background_index=1.0,
-        center_wl=wavelength_um,
-        N_f=1,
-        bc_x="PML",
-        bc_y="PML",
-        bc_z="PML",
-    )
-    sim.src_wl = np.asarray([wavelength_um], dtype=float) * sim.unit
-    add_oled_stack(sim)
-    lens_grid = add_lens_import(sim, height)
-    if channel is not None:
-        sim.add_source(
-            mode="plane",
-            name="reciprocal_source",
-            center=src_c,
-            size=src_s,
-            direction="backward",
-            src_wl=[wavelength_um],
-            bandwidth=0.0,
-            pol=channel["polarization_angle"],
-            theta=channel["theta_deg"],
-            phi=channel["phi_deg"],
-            single=True,
+def ensure_mapping():
+    global mapping, x0
+    if mapping is None:
+        mapping = ms.Opt_MS2.Mapping(
+            Symmetry_sim=False,
+            Sym_geo_width=False,
+            Sym_geo_C8=False,
+            Sym_geo_length=False,
+            Sym_geo_C2=False,
+            DR_info=DR_info,
+            DR_N_info=DR_N_info,
+            Mask_pixels=0,
+            MFS=0.1,
+            MGS=0.1,
+            Is_radial_3d={
+                "enabled": True,
+                "N_radius": radial_design_grids,
+                "radius": radial_design_radius,
+                "outside_value": 0.0,
+                "apply_filter": False,
+                "vertical_grating": False,
+            },
+            Is_slanted_grating=False,
         )
-    if top_monitor:
-        sim.add_monitor(name="top_power", center=monitor_c, size=monitor_s)
-    if eml_monitor:
-        sim.add_monitor(name="EML_monitor", center=[0.0, 0.0, eml_c[2]], size=[window_x, window_y, 0.0])
-    try:
-        sim.fdtd.setnamed("FDTD", "simulation time", env_float("MSOPT_OLED_LENS_SIM_TIME_FS", 1200.0) * 1e-15)
-    except Exception:
-        pass
-    return sim, lens_grid
+        x0 = G.grating_initial_density * np.ones(mapping.parameter_count)
+    return mapping
 
 
-def evaluate_height(height, n_samples=None, farfield_resolution=None, save_patterns=False):
-    print(f"[sweep] height={height:.6g} um")
-    channel_values = []
-    channel_records = []
-    lens_grid = None
-    for channel_idx, channel in enumerate(target_channels):
-        print(
-            f"[sweep] h={height:.4g} reciprocal channel {channel_idx + 1}/{len(target_channels)} "
-            f"{channel['name']}"
-        )
-        sim, lens_grid = build_sim(height, channel=channel, top_monitor=False, eml_monitor=True)
-        try:
-            sim.run(name=f"OLED_lens_h{height:.4g}_{channel['name']}", save=False)
-            Eres = sim.fdtd.getresult("EML_monitor", "E")
-            Eall = np.asarray(Eres["E"], dtype=np.complex128)
-            Ex = Eall[..., 0]
-            Ey = Eall[..., 1]
-            Ez = Eall[..., 2]
-            value, raw_intensity, uniformity = reciprocal_channel_fom(Ex, Ey, Ez, channel)
-        finally:
+def add_channel_dipoles(sim, channel):
+    """Install a channel's emitter(s).
+
+    A channel carrying "dipoles" is a grid fired TOGETHER: every dipole goes into
+    one Lumerical group called "source" so the solver treats them as a single
+    coherent excitation (OLED_new's arrangement). Otherwise it is the single
+    representative dipole.
+    """
+    pts = channel.get("dipoles")
+    if not pts:
+        oc.add_dipole(G, sim, channel["dipole_x"], channel["dipole_y"],
+                      channel["dipole_z"], channel["polarization"])
+        return 1
+    for k, (x, y, z) in enumerate(pts):
+        oc.add_dipole(G, sim, x, y, z, channel["polarization"],
+                      name=f"opt_dipole_{k}", enabled=True, group_name="source")
+    return len(pts)
+
+
+def build_optimization_problem():
+    target_info = oc.build_target_orders(G)
+    oc.save_target_orders(G, target_info)
+    sims, opts, histories = [None] * N_fom, [None] * N_fom, [[] for _ in range(N_fom)]
+
+    for idx, channel in enumerate(target_channels):
+        sim = sims[idx] = oc.make_sim(G, [G.Sx, G.Sy, G.Sz])
+        add_channel_dipoles(sim, channel)
+        sim.add_monitor(G.target_monitor_name, G.target_monitor_c, G.target_monitor_s)
+
+        if oc.env_flag("MSOPT_OLED_BULK_NORMALIZATION", "1"):
+            oc.set_fdtd_background_index(sim.fdtd, G.bulk_reference_index)
+            sim.run(name=f"bulk_reference_{idx}", save=True)
+            oc.load_run_results(sim)
+            bulk_power = oc.read_dipole_power(sim.fdtd, oc.source_freqs(G, sim)) or oc.read_source_power(sim.fdtd, oc.source_freqs(G, sim)) or G.channel_power_floor
+            channel["bulk_reference_power"] = max(float(bulk_power), G.channel_power_floor)
+            grid = sim.fdtd.getresult(G.target_monitor_name, "E")
+            channel["angular_target"] = oc.angular_target_from_monitor_grid(G, grid["x"], grid["y"], target_info)
+            if idx == 0:
+                oc.save_angular_target_preview(G, channel["angular_target"])
+            sim.fdtd.switchtolayout()
+            oc.set_fdtd_background_index(sim.fdtd, G.background_index)
+            print(f"[bulk] channel {idx}: n={G.bulk_reference_index:.4g}, power={channel['bulk_reference_power']:.6e}")
+        else:
+            channel["bulk_reference_power"] = np.nan
+            channel["angular_target"] = None
+
+        oc.add_stack(G, sim)
+        sim.add_design_grid("design", G.design_c, G.design_s, G.design_high_index, G.design_low_index, G.design_grids, G.grating_initial_density * np.ones(G.design_grids), float(np.mean(G.visible_wavelengths)))
+        sim.add_design_monitor()
+        channel["design_incident_reference_power"] = oc.measure_design_incident_reference(G, channel)
+
+        def J(Ex, Ey, Hx, Hy, channel_idx=idx, channel=channel):
+            if channel["angular_target"] is None:
+                channel["angular_target"] = oc.angular_target_from_monitor_grid(G, opts[channel_idx].xg, opts[channel_idx].yg, target_info)
+            terms = oc.channel_fom_terms(G, Ex, Ey, Hx, Hy, channel)
+            # Objective: FoM = throughput * match**ratio_emphasis (oc.angular_powers).
+            fom = npa.clip(terms["fom"], 0.0, G.score_cap)
             try:
-                sim.fdtd.close()
+                at = channel["angular_target"]
+                thetas = np.asarray(at["angle_thetas"], dtype=float)
+                tgt = np.asarray(at["target_profile"], dtype=float)
+                profile = np.real(np.asarray(terms["profile"], dtype=np.complex128))
+                thru = float(np.real(terms["throughput"]))
+                match = float(np.real(terms["match"]))
+                q = profile / max(thru, 1e-30)                    # emission shape within cone
+                channel["last_fom_metrics"] = {
+                    "fom": float(np.real(fom)),
+                    "throughput": thru,
+                    "match": match,
+                    "angle_thetas": thetas.tolist(),
+                    "target_profile": tgt.tolist(),
+                    "angle_profile": profile.tolist(),
+                    "off_target_fraction": float(max(0.0, 1.0 - thru)),
+                }
+                histories[channel_idx].append(float(np.real(fom)))
+                if G.opt_emission_plot:
+                    channel["last_angle_profile"] = profile.tolist()
+                # Achieved shape q vs the linear target t at every in-range emission angle.
+                inr = np.asarray(at["in_range"], dtype=float) > 0.5
+                prof_str = ", ".join(f"{t:.0f}:{qi:.2f}/{ti:.2f}" for t, qi, ti in zip(thetas[inr], q[inr], tgt[inr]))
+                print(
+                    f"[dipole {channel_idx}] FoM={float(np.real(fom)):.4f}  "
+                    f"thru={thru:.3f} match={match:.3f}  q/t[{prof_str}]"
+                )
             except Exception:
                 pass
-        channel_values.append(value)
-        channel_records.append(
-            {
-                "height_um": height,
-                "channel": channel["name"],
-                "theta_deg": channel["theta_deg"],
-                "polarization": channel["polarization"],
-                "eml_component": channel["eml_component"],
-                "source_power_norm": channel["source_power_norm"],
-                "reciprocal_eml_proxy": value,
-                "mean_absE2": raw_intensity,
-                "uniformity": uniformity,
-            }
+            return fom
+
+        opt = opts[idx] = ms.Lumerical_utill.LumericalOptimizationProblem(
+            sim,
+            objective_functions=[J],
+            objective_arguments=[0, 1, 3, 4],
+            FoM_size=G.target_monitor_s,
+            FoM_center=G.target_monitor_c,
+            adj_fwd=False,
+            opt_idx=idx,
+            broadband_adjoint=True,
         )
-    score = combine_oled_scalar_from_values(channel_values)
-    angle_powers, pol_matrix, fractions, ratios_to_zero = summarize_reciprocal_values(channel_values)
-    ff0_mean = float(angle_powers[0])
-    ff45_mean = float(angle_powers[1]) if len(angle_powers) > 1 else 0.0
-    ratio45 = float(ratios_to_zero[1]) if len(ratios_to_zero) > 1 else 0.0
-    summary = {
-        "height_um": height,
-        "curvature_radius_um": spherical_cap_radius(lens_radius, height),
-        "ff0_mean": ff0_mean,
-        "ff45_mean": ff45_mean,
-        "ratio45_to_0": ratio45,
-        "top_efficiency_mean": 0.0,
-        "score": score,
-        "records": channel_records,
-        "patterns": [],
-        "lens_grid": lens_grid,
-        "angle_fractions": fractions,
-        "polarization_matrix": pol_matrix,
-    }
-    print(
-        f"[sweep] h={height:.6g} reciprocal_score={score:.6e}, "
-        f"angle_power_0={ff0_mean:.6e}, angle_power_45={ff45_mean:.6e}, "
-        f"ratio45/0={ratio45:.4f}, fraction_0={fractions[0]:.4f}, "
-        f"fraction_45={fractions[1]:.4f}"
-    )
-    return summary
+
+        def hook(problem, channel=channel):
+            freqs = np.asarray(getattr(problem, "src_freqs", []), dtype=float).reshape(-1)
+            freqs = freqs if freqs.size else oc.source_freqs(G, problem.sim)
+            source_power = oc.read_source_power(problem.sim.fdtd, freqs)
+            current_power = oc.read_dipole_power(problem.sim.fdtd, freqs)
+            # Normalize by the fixed reference power incident on the design region
+            # (measured once with the design + superstrate index-matched, so no
+            # back-reflection). Falls back to bulk/source/dipole power if unavailable.
+            norm_power, source = oc.choose_norm_power(G, channel.get("design_incident_reference_power"), channel.get("bulk_reference_power"), source_power, current_power)
+            T = oc.read_transmission(problem.sim.fdtd, G.target_monitor_name)
+            channel["last_normalization_power"] = norm_power
+            channel["last_normalization_power_source"] = source
+            channel["last_source_power"] = oc.valid_power(source_power) or np.nan
+            channel["last_current_dipole_power"] = oc.valid_power(current_power) or np.nan
+            channel["last_top_flux_sign"] = 1.0 if T >= 0.0 else -1.0
+            channel["last_top_monitor_transmission"] = T
+            # (The legacy diagnostic-only raw-flux calibration is gone: the shared
+            # angular-target dicts no longer carry monitor_cell_area.)
+
+        opt.forward_result_hook = hook
+        print(f"[setup] channel {idx}: pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f},{channel['dipole_z']:.3f}), pol={channel['polarization']}")
+
+    return sims, opts, histories
 
 
-def run_dipole_postprocess_for_height(height, n_samples, farfield_resolution):
-    print(f"[postprocess] direct dipole validation for best height={height:.6g} um")
-    sim, lens_grid = build_sim(height, channel=None, top_monitor=True, eml_monitor=False)
-    positions = sample_positions(n_samples)
-    records = []
-    patterns = []
+def iter_plot(X, vals):
+    # Per-iteration snapshots, exactly what the legacy adjoint_loop inlined.
     try:
-        for pol in ("x", "y"):
-            for sample_idx, position in enumerate(positions):
-                print(f"[postprocess] h={height:.4g} dipole {pol} {sample_idx + 1}/{len(positions)}")
-                sim.fdtd.switchtolayout()
-                add_dipole(sim.fdtd, position, pol)
-                sim.run(name=f"OLED_lens_best_h{height:.4g}_{pol}_{sample_idx}", save=False)
-                transmission = abs(get_transmission(sim.fdtd, "top_power"))
-                angle_values, ff_error = farfield_samples(
-                    sim.fdtd,
-                    "top_power",
-                    [0.0, 45.0],
-                    farfield_resolution,
-                )
-                angles, pattern, pattern_error = signed_theta_pattern(sim.fdtd, "top_power", farfield_resolution)
-                if not pattern_error:
-                    patterns.append((angles, pattern))
-                records.append(
-                    {
-                        "height_um": height,
-                        "polarization": pol,
-                        "sample_idx": sample_idx,
-                        "x_um": position[0],
-                        "y_um": position[1],
-                        "z_um": position[2],
-                        "top_efficiency": transmission,
-                        "ff0": angle_values[0.0],
-                        "ff45": angle_values[45.0],
-                        "farfield_error": ff_error or pattern_error,
-                    }
-                )
-    finally:
+        path = oc.save_current_design_sections(G, X, vals, mapping=mapping)
+        print(f"[outcoupling] saved temporary design section: {path}")
+    except Exception as exc:
+        print(f"[outcoupling] skipped temporary design section: {exc}")
+    if G.opt_emission_plot:
         try:
-            sim.fdtd.close()
-        except Exception:
-            pass
-
-    best = evaluate_height(height)
-    best["records"] = records
-    best["patterns"] = patterns
-    best["lens_grid"] = lens_grid
-    top = np.asarray([r["top_efficiency"] for r in records], dtype=float)
-    best["top_efficiency_mean"] = float(np.nanmean(top)) if np.any(np.isfinite(top)) else 0.0
-    return best
-
-
-def save_sweep_results(summaries):
-    path = os.path.join(design_dir, "OLED_lens_sweep_summary.csv")
-    fields = [
-        "height_um",
-        "curvature_radius_um",
-        "ff0_mean",
-        "ff45_mean",
-        "ratio45_to_0",
-        "top_efficiency_mean",
-        "score",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fields)
-        writer.writeheader()
-        for item in summaries:
-            writer.writerow({field: item[field] for field in fields})
-    print(f"[sweep] saved summary: {path}")
-
-    values = {field: np.asarray([item[field] for item in summaries], dtype=float) for field in fields}
-    fig, ax1 = plt.subplots(figsize=(7, 4.2))
-    ax1.plot(values["height_um"], values["score"], "o-", label="score")
-    ax1.plot(values["height_um"], values["ff0_mean"], "s-", label="0 deg intensity")
-    ax1.set_xlabel("lens height (um)")
-    ax1.set_ylabel("score / intensity")
-    ax1.grid(True, alpha=0.3)
-    ax2 = ax1.twinx()
-    ax2.plot(values["height_um"], values["ratio45_to_0"], "^-", color="tab:red", label="45/0 ratio")
-    ax2.axhline(env_float("MSOPT_OLED_LENS_TARGET_45_RATIO", 0.8), color="tab:red", linestyle="--", alpha=0.5)
-    ax2.set_ylabel("45 deg / 0 deg")
-    lines = ax1.get_lines() + ax2.get_lines()
-    ax1.legend(lines, [line.get_label() for line in lines], loc="best")
-    fig.tight_layout()
-    png = os.path.join(design_dir, "OLED_lens_sweep_curve.png")
-    fig.savefig(png, dpi=200)
-    plt.close(fig)
-    print(f"[sweep] saved curve: {png}")
-
-
-def save_best_records(best):
-    records = best["records"]
-    csv_path = os.path.join(design_dir, "OLED_lens_best_dipole_samples.csv")
-    fields = [
-        "height_um",
-        "polarization",
-        "sample_idx",
-        "x_um",
-        "y_um",
-        "z_um",
-        "top_efficiency",
-        "ff0",
-        "ff45",
-        "farfield_error",
-    ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(records)
-    print(f"[postprocess] saved best dipole records: {csv_path}")
-
-    txt_path = os.path.join(design_dir, "OLED_lens_best_summary.txt")
-    with open(txt_path, "w", encoding="utf-8") as fp:
-        fp.write("method lens_height_parameter_sweep\n")
-        for key in (
-            "height_um",
-            "curvature_radius_um",
-            "ff0_mean",
-            "ff45_mean",
-            "ratio45_to_0",
-            "top_efficiency_mean",
-            "score",
-        ):
-            fp.write(f"{key} {best[key]:.16e}\n")
-        fp.write(f"lens_diameter_um {lens_diameter:.16e}\n")
-        fp.write(f"lens_index {lens_index:.16e}\n")
-        fp.write(f"resolution_grids_per_um {resolution}\n")
-    print(f"[postprocess] saved best summary: {txt_path}")
-
-
-def save_lens_images(best):
-    x, y, z, inside = best["lens_grid"]
-    rho_zavg = np.mean(inside.astype(float), axis=2).T
-    mid_y = inside.shape[1] // 2
-    section = inside[:, mid_y, :].T.astype(float)
-
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-    axes[0].imshow(
-        section,
-        origin="lower",
-        extent=(x[0], x[-1], z[0], z[-1]),
-        cmap="Blues",
-        aspect="auto",
-        interpolation="nearest",
-    )
-    axes[0].set_xlabel("x (um)")
-    axes[0].set_ylabel("z (um)")
-    axes[0].set_title("Best lens x-z section")
-    axes[1].imshow(
-        rho_zavg,
-        origin="lower",
-        extent=(x[0], x[-1], y[0], y[-1]),
-        cmap="Blues",
-        vmin=0,
-        vmax=1,
-        interpolation="nearest",
-    )
-    axes[1].set_xlabel("x (um)")
-    axes[1].set_ylabel("y (um)")
-    axes[1].set_title("Best lens top view")
-    fig.tight_layout()
-    path = os.path.join(design_dir, "OLED_lens_best_geometry.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    print(f"[postprocess] saved best geometry image: {path}")
-
-
-def save_best_angular_pattern(best):
-    if not best["patterns"]:
-        print("[postprocess] skipped angular pattern: no far-field patterns")
-        return
-    angles = best["patterns"][0][0]
-    values = np.asarray([pattern for _, pattern in best["patterns"]], dtype=float)
-    mean_pattern = np.nanmean(values, axis=0)
-    if not np.any(np.isfinite(mean_pattern)):
-        print("[postprocess] skipped angular pattern: all samples are NaN")
-        return
-    mean_pattern = np.nan_to_num(mean_pattern, nan=0.0, posinf=0.0, neginf=0.0)
-    normalized = mean_pattern / max(float(np.max(mean_pattern)), 1e-30)
-    txt = os.path.join(design_dir, "OLED_lens_best_angular_pattern.txt")
-    np.savetxt(txt, np.column_stack([angles, normalized, mean_pattern]), header="theta_deg normalized_intensity raw_mean_intensity")
-
-    fig = plt.figure(figsize=(6, 3.6))
-    ax = fig.add_subplot(111, projection="polar")
-    ax.plot(np.deg2rad(angles), normalized, linewidth=2.0)
-    ax.set_thetamin(-90)
-    ax.set_thetamax(90)
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.set_rlim(0.0, 1.0)
-    ax.grid(True, alpha=0.35)
-    ax.set_title("OLED lens best angular emission")
-    fig.tight_layout()
-    png = os.path.join(design_dir, "OLED_lens_best_angular_pattern.png")
-    fig.savefig(png, dpi=200)
-    plt.close(fig)
-    print(f"[postprocess] saved angular pattern data: {txt}")
-    print(f"[postprocess] saved angular pattern plot: {png}")
+            epath = oc.save_optimization_emission_plot(G, target_channels=target_channels)
+            if epath:
+                print(f"[outcoupling] saved current emission plot: {epath}")
+        except Exception as exc:
+            print(f"[outcoupling] skipped emission plot: {exc}")
 
 
 def main():
+    if oc.env_flag("MSOPT_OLED_SESSION_TEST", "0"):
+        oc.session_test_banner(G, N_fom)
+        return
+
     start = time.time()
-    heights = lens_height_grid()
-    post_samples = env_int("MSOPT_OLED_LENS_POSTPROCESS_SAMPLES_PER_POL", 20)
-    farfield_resolution = env_int("MSOPT_OLED_LENS_FARFIELD_RES", 181)
-    print("OLED lens parameter sweep")
-    print(f"RUN_DIR={RUN_DIR}")
-    print(f"wavelength_um={wavelength_um}, resolution={resolution} grids/um")
-    print(f"window={window_x}x{window_y} um, lens_diameter={lens_diameter} um, lens_index={lens_index}")
-    print(f"height sweep={heights}")
-    print(
-        f"sweep_eval=OLED.py reciprocal EML proxy, postprocess_samples_per_pol={post_samples}, "
-        f"farfield_resolution={farfield_resolution}"
-    )
-    print(
-        "target: same combined FoM as OLED.py "
-        f"(distribution_weight={target_distribution_weight}, "
-        f"polarization_balance_weight={polarization_balance_weight})"
-    )
-
-    summaries = [
-        evaluate_height(float(height))
-        for height in heights
-    ]
-    save_sweep_results(summaries)
-    best = max(summaries, key=lambda item: item["score"])
-    print(
-        f"[sweep] best height={best['height_um']:.6g} um, "
-        f"R={best['curvature_radius_um']:.6g} um, score={best['score']:.6e}"
-    )
-
-    if env_flag("MSOPT_OLED_LENS_POSTPROCESS", "1"):
-        best = run_dipole_postprocess_for_height(
-            float(best["height_um"]),
-            post_samples,
-            farfield_resolution,
+    post_only = oc.env_flag("MSOPT_OLED_POSTPROCESS_ONLY", "0")
+    ensure_mapping()
+    if not post_only:
+        if ag_jacobian is None:
+            raise RuntimeError("autograd is required for optimization. Install autograd or run with MSOPT_OLED_POSTPROCESS_ONLY=1.")
+        sims, opts, histories = build_optimization_problem()
+        print(
+            f"[setup] period={G.Sx:g}x{G.Sy:g} um, design={G.design_grids}, N_fom={N_fom}, "
+            f"bulk_n={G.bulk_reference_index:g}, opt_bc={G.bc_xy}"
         )
-        save_best_records(best)
-        save_lens_images(best)
-        save_best_angular_pattern(best)
-    else:
-        print("[postprocess] skipped: MSOPT_OLED_LENS_POSTPROCESS is disabled")
-    print(f"Runtime: {time.time() - start:.2f} seconds")
+        optimizer = ms.Opt_MS2.OPT_Ms(
+            x0, dJ_0,
+            design_dir=G.design_dir,
+            local_best_dir=G.local_dir,
+            Born_k=99,
+            Initial_LR=0.2,
+            Raw=False,
+        )
+        optimizer.flag = True
+        optimizer(mapping, N_fom, oc.adjoint_loop(G, opts, iter_plot_fn=iter_plot, combine=combine_fom))
+        oc.save_result_plots(optimizer, G.design_dir)
+
+    if oc.env_flag("MSOPT_OLED_POSTPROCESS", "1"):
+        # MSOPT_OLED_POSTPROCESS_DESIGN lets the postprocess re-run on a design from a
+        # previous run (e.g. a Done/ result) instead of this run's lastdesign.txt.
+        design_path = os.environ.get("MSOPT_OLED_POSTPROCESS_DESIGN", "").strip()
+        if not (design_path and os.path.exists(design_path)):
+            design_path = os.path.join(G.design_dir, "lastdesign.txt")
+        # A PLANAR run characterizes the bare stack, so it needs no design at
+        # all: the design region is filled with the low index either way. Do not
+        # let the "no design file" check abort it.
+        planar_only = oc.planar_requested() and not os.path.exists(design_path)
+        if planar_only:
+            print("[postprocess] PLANAR stack characterization (no design required)")
+            oc.run_postprocess(G, np.zeros(int(np.prod(G.design_grids)), dtype=float), mapping=None)
+        elif os.path.exists(design_path):
+            print(f"[postprocess] using design: {design_path}")
+            oc.run_postprocess(G, np.loadtxt(design_path), mapping=mapping)
+        else:
+            print(f"[postprocess] skipped: {design_path} not found")
+    print(f"Runtime setup time: {time.time() - start:.2f} seconds")
 
 
 if __name__ == "__main__":

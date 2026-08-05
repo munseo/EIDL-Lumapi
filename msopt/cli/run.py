@@ -13,6 +13,28 @@ from pathlib import Path
 from .common import discover_lumerical, ensure_first_run_config
 
 
+def _isolate_lumerical_config(env: dict[str, str], run_dir: Path) -> Path:
+    """Give each run a private Qt/Lumerical resource configuration.
+
+    Lumerical stores Resource Manager settings in FDTD Solutions.ini.  Sharing
+    that file between concurrent jobs allows one run's thread/GPU settings to
+    leak into another run between setresource() and run().  XDG_CONFIG_HOME is
+    the Qt-supported way to isolate the config without changing HOME.
+    """
+    home = Path(env.get("HOME", str(Path.home()))).expanduser()
+    source_root = Path(env.get("XDG_CONFIG_HOME", str(home / ".config"))).expanduser()
+    source_dir = source_root / "Lumerical"
+    target_root = run_dir / ".xdg_config"
+    target_dir = target_root / "Lumerical"
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    if source_dir.exists():
+        shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+    else:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    env["XDG_CONFIG_HOME"] = str(target_root)
+    return target_root
+
+
 def _parse_cpu_list(spec: str) -> set[int]:
     cpus: set[int] = set()
     for part in spec.split(","):
@@ -270,6 +292,42 @@ def _active_gpu_compute_jobs(gpu_index: int) -> list[str]:
     return jobs
 
 
+def _gpu_utilization_pct(gpu_index: int) -> int | None:
+    nvidia_smi = shutil_which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        try:
+            index = int(parts[0])
+            utilization = int(parts[1])
+        except ValueError:
+            continue
+        if index == gpu_index:
+            return utilization
+    return None
+
+
+def _busy_gpu_util_threshold_default() -> int:
+    value = os.environ.get("EIDL_RUN_BUSY_GPU_UTIL_THRESHOLD", "40")
+    try:
+        return int(value)
+    except ValueError:
+        return 40
+
+
 def _write_info(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + "\n")
 
@@ -407,6 +465,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run even if the selected GPU already has compute jobs.",
     )
+    parser.add_argument(
+        "--busy-gpu-util-threshold",
+        type=int,
+        default=_busy_gpu_util_threshold_default(),
+        help=(
+            "Allow sharing a GPU with active jobs when current GPU utilization is below this percent. "
+            "Default: 40. Set 0 to require an idle GPU unless --allow-busy-gpu is used."
+        ),
+    )
     parser.add_argument("--tag", help="Optional profiling result tag.")
     parser.add_argument("--desc", help="Optional run description.")
     parser.add_argument("--no-taskset", action="store_true", help="Do not pin the Python process to CPU cores.")
@@ -434,12 +501,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.threads < 1:
         parser.error("-th/--threads must be >= 1")
+    if not 0 <= args.busy_gpu_util_threshold <= 100:
+        parser.error("--busy-gpu-util-threshold must be between 0 and 100")
 
     active_gpu_jobs = _active_gpu_compute_jobs(args.gpu)
-    if active_gpu_jobs and not args.allow_busy_gpu:
+    gpu_utilization = _gpu_utilization_pct(args.gpu)
+    gpu_utilization_text = f"{gpu_utilization}%" if gpu_utilization is not None else "(unknown)"
+    sharing_busy_gpu = (
+        bool(active_gpu_jobs)
+        and not args.allow_busy_gpu
+        and gpu_utilization is not None
+        and gpu_utilization < args.busy_gpu_util_threshold
+    )
+    if active_gpu_jobs and not args.allow_busy_gpu and not sharing_busy_gpu:
         print(f"Selected GPU {args.gpu} already has compute jobs:", file=sys.stderr)
         for job in active_gpu_jobs:
             print(f"  - {job}", file=sys.stderr)
+        print(
+            f"Current GPU utilization is {gpu_utilization_text}; busy GPU sharing requires "
+            f"< {args.busy_gpu_util_threshold}%.",
+            file=sys.stderr,
+        )
         print("Use `resource` to pick an allocatable GPU, or pass --allow-busy-gpu to override.", file=sys.stderr)
         return 2
 
@@ -501,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Use --outdir /path/you/can/write.", file=sys.stderr)
         return 2
     run_dir = _run_dir(tag, ongoing_root)
+    lumerical_config_root = _isolate_lumerical_config(env, run_dir)
     log_path = run_dir / f"{script.stem}_output.log"
     env["EIDL_RUN_DIR"] = str(run_dir)
     env["EIDL_LUMERICAL_DATA_DIR"] = str(output_base)
@@ -509,9 +592,18 @@ def main(argv: list[str] | None = None) -> int:
     print("EIDL-Lumapi run")
     print(f"  script                    : {script}")
     print(f"  GPU                       : {args.gpu}")
+    print(f"  GPU utilization           : {gpu_utilization_text}")
     if active_gpu_jobs:
         print(f"  GPU warning               : selected GPU has active jobs: {'; '.join(active_gpu_jobs)}")
+        if sharing_busy_gpu:
+            print(
+                "  GPU sharing               : allowed because utilization "
+                f"{gpu_utilization}% < {args.busy_gpu_util_threshold}%"
+            )
+        elif args.allow_busy_gpu:
+            print("  GPU sharing               : allowed by --allow-busy-gpu")
     print(f"  FDTD threads              : {args.threads}")
+    print(f"  isolated Lumerical config : {lumerical_config_root}")
     print(f"  CPU affinity              : {env.get('TASKSET_CPUS', '(disabled)')}")
     if allocatable_threads is not None:
         print(f"  allocatable CPU threads   : {allocatable_threads}")
@@ -547,7 +639,20 @@ def main(argv: list[str] | None = None) -> int:
             f"Launch cwd: {launch_cwd}",
             f"Execution cwd: {run_dir}",
             f"GPU: {args.gpu}",
+            f"GPU utilization: {gpu_utilization_text}",
             f"GPU active jobs: {'; '.join(active_gpu_jobs) if active_gpu_jobs else '(none)'}",
+            (
+                "GPU sharing: "
+                + (
+                    f"allowed by utilization {gpu_utilization}% < {args.busy_gpu_util_threshold}%"
+                    if sharing_busy_gpu
+                    else "allowed by --allow-busy-gpu"
+                    if active_gpu_jobs and args.allow_busy_gpu
+                    else "(not needed)"
+                    if not active_gpu_jobs
+                    else "(blocked)"
+                )
+            ),
             f"FDTD threads: {args.threads}",
             f"CPU affinity: {env.get('TASKSET_CPUS', '(disabled)')}",
             f"Allocatable CPU threads: {allocatable_threads if allocatable_threads is not None else '(disabled)'}",

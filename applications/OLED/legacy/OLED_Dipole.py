@@ -17,8 +17,8 @@ import msopt as ms
 # PML/Bloch-selectable OLED reciprocity optimization scaffold
 # Coordinate: 3D Cartesian
 # Propagation axis: z
-# Boundary: Periodic in x/y and PML in z by default. Set boundary_mode below
-# to "Bloch" for oblique periodic validation or "PML" for finite-window tests.
+# Boundary: selectable in x/y and PML in z. Set
+# MSOPT_OLED_BOUNDARY_MODE to "Bloch", "Periodic", or "PML".
 #
 # Design idea:
 # - Treat the OLED/pixel as a finite supercell/window.
@@ -51,7 +51,7 @@ bandwidth = 0.0
 # -----------------------------------------------------------------------------
 # Periodic 3D setup
 # -----------------------------------------------------------------------------
-boundary_mode = "Bloch"  # "Periodic", "Bloch", or "PML"
+boundary_mode = os.environ.get("MSOPT_OLED_BOUNDARY_MODE", "Bloch")
 boundary_mode_key = boundary_mode.strip().upper()
 if boundary_mode_key not in ("PML", "BLOCH", "PERIODIC"):
     raise ValueError("boundary_mode must be 'Periodic', 'Bloch', or 'PML'.")
@@ -178,6 +178,10 @@ source_norm_c = [0, 0, src_c[2] - 0.05]
 out_s = [Sx, Sy, 0]
 out_c = [0, 0, Z_max - 0.15]
 
+target_monitor_name = "FoM_monitor"
+target_monitor_s = out_s
+target_monitor_c = out_c
+
 Nx = int(round(design_s[0] * resolution)) + 1
 Ny = int(round(design_s[1] * resolution)) + 1
 Nz = int(round(design_s[2] * resolution)) + 1
@@ -189,22 +193,92 @@ design_cells = Nx * Ny * Nz
 # Dipole-based LDOS optimization setup
 # =============================================================================
 
-# Dipole sample locations: center, 0.4R, 0.8R from center
+# Dipole sample configuration.
+# Defaults keep the requested cylindrical-symmetry setup: three x-polarized
+# dipoles on the x-axis at 0, 0.4R, and 0.8R. Every list can be overridden
+# through environment variables:
+# - MSOPT_OLED_DIPOLE_RADII_FRAC="0.0,0.4,0.8"
+# - MSOPT_OLED_DIPOLE_AZIMUTHS_DEG="0" for the x-axis default
+# - MSOPT_OLED_DIPOLE_POLARIZATIONS="x" or "x,y,z"
+# - MSOPT_OLED_DIPOLE_WEIGHTS="1,1,1"
+def _parse_float_list_env(name, default_values):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default_values)
+    values = []
+    for token in raw.replace(";", ",").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(float(token))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma- or space-separated list of floats.") from exc
+    return values or list(default_values)
+
+
+def _parse_str_list_env(name, default_values):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default_values)
+    values = [
+        token.strip().lower()
+        for token in raw.replace(";", ",").replace(" ", ",").split(",")
+        if token.strip()
+    ]
+    return values or list(default_values)
+
+
+def _broadcast_list(values, target_len, name):
+    if len(values) == target_len:
+        return list(values)
+    if len(values) == 1 and target_len > 1:
+        return list(values) * target_len
+    raise ValueError(f"{name} must have length 1 or {target_len}, got {len(values)}")
+
+
 active_radius = 0.5 * min(active_x, active_y)
-dipole_radii_frac = [0.0, 0.4, 0.8]  # Fractions of active_radius
-dipole_positions = [
-    (float(frac * active_radius), 0.0, float(eml_c[2]))
-    for frac in dipole_radii_frac
-]
+raw_dipole_radii_frac = _parse_float_list_env("MSOPT_OLED_DIPOLE_RADII_FRAC", [0.0, 0.4, 0.8])
+raw_dipole_azimuths_deg = _parse_float_list_env("MSOPT_OLED_DIPOLE_AZIMUTHS_DEG", [0.0])
+raw_dipole_polarizations = _parse_str_list_env("MSOPT_OLED_DIPOLE_POLARIZATIONS", ["x"])
+raw_dipole_weights = _parse_float_list_env("MSOPT_OLED_DIPOLE_WEIGHTS", [1.0])
+
+sample_count = max(
+    len(raw_dipole_radii_frac),
+    len(raw_dipole_azimuths_deg),
+    len(raw_dipole_polarizations),
+    len(raw_dipole_weights),
+)
+
+dipole_radii_frac = _broadcast_list(raw_dipole_radii_frac, sample_count, "MSOPT_OLED_DIPOLE_RADII_FRAC")
+dipole_azimuths_deg = _broadcast_list(raw_dipole_azimuths_deg, sample_count, "MSOPT_OLED_DIPOLE_AZIMUTHS_DEG")
+dipole_polarizations = _broadcast_list(
+    raw_dipole_polarizations, sample_count, "MSOPT_OLED_DIPOLE_POLARIZATIONS"
+)
+dipole_weights = np.asarray(
+    _broadcast_list(raw_dipole_weights, sample_count, "MSOPT_OLED_DIPOLE_WEIGHTS"),
+    dtype=float,
+)
+
+dipole_positions = []
+for frac, azimuth_deg in zip(dipole_radii_frac, dipole_azimuths_deg):
+    azimuth_rad = np.deg2rad(azimuth_deg)
+    dipole_positions.append(
+        (
+            float(frac * active_radius * np.cos(azimuth_rad)),
+            float(frac * active_radius * np.sin(azimuth_rad)),
+            float(eml_c[2]),
+        )
+    )
 n_dipole_positions = len(dipole_positions)
 
-# Dipole polarization (x-polarized only)
-dipole_polarization = "x"
+# Keep the first polarization as the compatibility default for postprocess paths.
+dipole_polarization = dipole_polarizations[0]
 
 # Target efficiency curve: angle (deg) -> efficiency ratio
 # Format: "theta1:eff1,theta2:eff2,..." (linearly interpolated between points)
 # Example: "0:1.0,45:0.85" means 0° has efficiency 1.0, 45° has efficiency 0.85
-target_efficiency_curve_str = os.environ.get("MSOPT_OLED_TARGET_EFFICIENCY_CURVE", "0:1.0,45:0.85")
+target_efficiency_curve_str = os.environ.get("MSOPT_OLED_TARGET_EFFICIENCY_CURVE", "0:1.0,45:0.85,60:0.0")
 
 
 def parse_efficiency_curve(curve_str):
@@ -241,13 +315,6 @@ def parse_efficiency_curve(curve_str):
             efficiency_map[-theta] = eff
         if theta < 0.0 and -theta not in efficiency_map:
             efficiency_map[-theta] = eff
-
-    # Extend to ±90 degrees with zero efficiency if not already present.
-    # This ensures angles larger than the highest specified target angle continue decreasing.
-    if 90.0 not in efficiency_map:
-        efficiency_map[90.0] = 0.0
-    if -90.0 not in efficiency_map:
-        efficiency_map[-90.0] = 0.0
 
     curve_points = sorted((theta, efficiency_map[theta]) for theta in efficiency_map)
     return curve_points
@@ -286,6 +353,17 @@ def interpolate_efficiency_at_angle(theta_deg, efficiency_curve):
         return efficiency_curve[-1][1]
 
 
+def dipole_orientation_angles(polarization):
+    pol = str(polarization).strip().lower()
+    if pol == "x":
+        return 90.0, 0.0
+    if pol == "y":
+        return 90.0, 90.0
+    if pol == "z":
+        return 0.0, 0.0
+    raise ValueError(f"Unsupported dipole polarization: {polarization!r}")
+
+
 # Parse target efficiency curve
 target_efficiency_curve = parse_efficiency_curve(target_efficiency_curve_str)
 print(f"[ldos setup] target efficiency curve: {target_efficiency_curve}")
@@ -293,6 +371,13 @@ print(f"[ldos setup] target efficiency curve: {target_efficiency_curve}")
 
 def env_flag(name, default="1"):
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+angular_flux_cosine_weight = env_flag("MSOPT_OLED_ANGULAR_FLUX_COSINE_WEIGHT", "1")
+angular_use_hann_window = env_flag("MSOPT_OLED_ANGULAR_HANN_WINDOW", "0")
+angular_diagnostic_bin_half_width_deg = float(
+    os.environ.get("MSOPT_OLED_ANGULAR_BIN_HALF_WIDTH_DEG", "5.0")
+)
 
 
 def compute_diffraction_orders(wavelength_um, period_um, max_order=5):
@@ -339,6 +424,7 @@ def compute_target_field_with_diffraction_orders(
         - diffraction_orders: Possible orders and angles
         - angle_efficiencies: Efficiency at each order angle
         - target_spectrum: Relative amplitude at each angle
+        - radial_orders: Unique |m| ring orders for cylindrical target synthesis
     """
     # Compute all possible diffraction orders
     diffraction_orders = compute_diffraction_orders(wavelength_um, period_um, max_order=10)
@@ -357,11 +443,33 @@ def compute_target_field_with_diffraction_orders(
     target_spectrum = np.asarray(target_spectrum, dtype=float)
     if np.max(np.abs(target_spectrum)) > 0:
         target_spectrum = target_spectrum / np.max(np.abs(target_spectrum))
+
+    radial_order_map = {}
+    for (order_m, theta_deg, efficiency), amplitude in zip(angle_efficiencies, target_spectrum):
+        radial_order = abs(int(order_m))
+        radial_angle = abs(float(theta_deg))
+        entry = radial_order_map.get(radial_order)
+        if entry is None or float(amplitude) > entry["amplitude"]:
+            radial_order_map[radial_order] = {
+                "angle_deg": radial_angle,
+                "efficiency": float(efficiency),
+                "amplitude": float(amplitude),
+            }
+    radial_orders = [
+        (
+            radial_order,
+            radial_order_map[radial_order]["angle_deg"],
+            radial_order_map[radial_order]["efficiency"],
+            radial_order_map[radial_order]["amplitude"],
+        )
+        for radial_order in sorted(radial_order_map)
+    ]
     
     return {
         "diffraction_orders": diffraction_orders,
         "angle_efficiencies": angle_efficiencies,
         "target_spectrum": target_spectrum,
+        "radial_orders": radial_orders,
         "wavelength_um": wavelength_um,
         "period_um": period_um,
     }
@@ -378,6 +486,7 @@ def visualize_target_field_info(target_field_info, design_dir):
     diffraction_orders = target_field_info["diffraction_orders"]
     angle_efficiencies = target_field_info["angle_efficiencies"]
     target_spectrum = target_field_info["target_spectrum"]
+    radial_orders = target_field_info["radial_orders"]
     wavelength = target_field_info["wavelength_um"]
     period = target_field_info["period_um"]
     
@@ -385,31 +494,44 @@ def visualize_target_field_info(target_field_info, design_dir):
     orders = np.array([order for order, _, _ in angle_efficiencies])
     angles = np.array([angle for _, angle, _ in angle_efficiencies])
     efficiencies = np.array([eff for _, _, eff in angle_efficiencies])
+    radial_order_ids = np.array([order for order, _, _, _ in radial_orders])
+    radial_angles = np.array([angle for _, angle, _, _ in radial_orders])
+    radial_efficiencies = np.array([eff for _, _, eff, _ in radial_orders])
+    radial_spectrum = np.array([amp for _, _, _, amp in radial_orders])
     
     # Plot 1: Efficiency curve with diffraction orders
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     
     # Smooth efficiency curve for reference
-    angle_range = np.linspace(np.min(angles) - 5, np.max(angles) + 5, 181)
+    angle_range = np.linspace(0.0, max(float(np.max(np.abs(angles))) + 5.0, 1.0), 181)
     efficiency_range = np.array([
         interpolate_efficiency_at_angle(ang, target_efficiency_curve)
         for ang in angle_range
     ])
     
     ax1.plot(angle_range, efficiency_range, "b-", linewidth=2, label="Target efficiency curve")
-    ax1.scatter(angles, efficiencies, c=target_spectrum, cmap="viridis", s=100, 
-               label="Diffraction orders", zorder=5)
-    ax1.set_xlabel("Radiation angle (degrees)")
+    ax1.scatter(
+        radial_angles,
+        radial_efficiencies,
+        c=radial_spectrum,
+        cmap="viridis",
+        s=100,
+        label="Radial diffraction orders",
+        zorder=5,
+    )
+    ax1.set_xlabel("Polar radiation angle (degrees)")
     ax1.set_ylabel("Target efficiency")
-    ax1.set_title("Target efficiency at diffraction orders")
+    ax1.set_title("Cylindrical target efficiency")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
-    # Plot 2: Diffraction spectrum
-    ax2.bar(angles, target_spectrum, width=2.0, alpha=0.7)
-    ax2.set_xlabel("Radiation angle (degrees)")
+    # Plot 2: Cylindrical diffraction ring spectrum
+    ax2.bar(radial_angles, radial_spectrum, width=2.0, alpha=0.7)
+    for order, angle in zip(radial_order_ids, radial_angles):
+        ax2.text(angle, 0.02, f"|m|={int(order)}", rotation=90, va="bottom", ha="center", fontsize=8)
+    ax2.set_xlabel("Polar radiation angle (degrees)")
     ax2.set_ylabel("Normalized amplitude")
-    ax2.set_title(f"Target diffraction spectrum (λ={wavelength}μm, period={period}μm)")
+    ax2.set_title(f"Cylindrical ring spectrum (lambda={wavelength}um, period={period}um)")
     ax2.grid(True, alpha=0.3)
     
     fig.tight_layout()
@@ -429,30 +551,316 @@ def visualize_target_field_info(target_field_info, design_dir):
         fp.write(f"Order\tAngle(deg)\tTarget_Eff\tSpectrum_Amp\n")
         for order, angle, eff, amp in zip(orders, angles, efficiencies, target_spectrum):
             fp.write(f"{int(order)}\t{angle:8.3f}\t{eff:8.4f}\t{amp:8.4f}\n")
+        fp.write(f"\nCylindrical radial orders:\n")
+        fp.write(f"|Order|\tPolar_Angle(deg)\tTarget_Eff\tRing_Amp\n")
+        for order, angle, eff, amp in radial_orders:
+            fp.write(f"{int(order)}\t{angle:8.3f}\t{eff:8.4f}\t{amp:8.4f}\n")
     print(f"[ldos setup] saved target field summary: {summary_path}")
+
+    profile_path = os.path.join(design_dir, "LDOS_target_field_profile.csv")
+    with open(profile_path, "w", encoding="utf-8") as fp:
+        fp.write("signed_order,angle_deg,target_efficiency,spectrum_amplitude\n")
+        for order, angle, eff, amp in zip(orders, angles, efficiencies, target_spectrum):
+            fp.write(f"{int(order)},{angle:.6f},{eff:.6f},{amp:.6f}\n")
+    print(f"[ldos setup] saved target field profile: {profile_path}")
+
+    radial_profile_path = os.path.join(design_dir, "LDOS_target_field_radial_orders.csv")
+    with open(radial_profile_path, "w", encoding="utf-8") as fp:
+        fp.write("radial_order,polar_angle_deg,target_efficiency,ring_amplitude\n")
+        for order, angle, eff, amp in radial_orders:
+            fp.write(f"{int(order)},{angle:.6f},{eff:.6f},{amp:.6f}\n")
+    print(f"[ldos setup] saved radial target field profile: {radial_profile_path}")
+
+
+def nonnegative_efficiency_curve_arrays(efficiency_curve):
+    efficiency_by_abs_angle = {}
+    for theta_deg, efficiency in efficiency_curve:
+        theta_key = abs(float(theta_deg))
+        efficiency_by_abs_angle[theta_key] = max(
+            float(efficiency_by_abs_angle.get(theta_key, -np.inf)),
+            float(efficiency),
+        )
+    if not efficiency_by_abs_angle:
+        return np.asarray([0.0]), np.asarray([1.0])
+    angles = np.asarray(sorted(efficiency_by_abs_angle), dtype=float)
+    efficiencies = np.asarray([efficiency_by_abs_angle[angle] for angle in angles], dtype=float)
+    efficiencies = np.maximum(efficiencies, 0.0)
+    if np.max(efficiencies) <= 0.0:
+        efficiencies = np.ones_like(efficiencies)
+    return angles, efficiencies
+
+
+def build_dft_matrix(n_points):
+    idx = np.arange(int(n_points), dtype=float)
+    return np.exp(-2j * np.pi * np.outer(idx, idx) / float(n_points))
+
+
+def angular_bin_mask(theta_grid_deg, center_deg, half_width_deg, propagating):
+    lo = max(0.0, float(center_deg) - float(half_width_deg))
+    hi = min(90.0, float(center_deg) + float(half_width_deg))
+    return np.asarray((theta_grid_deg >= lo) & (theta_grid_deg <= hi) & propagating, dtype=float)
+
+
+def build_angular_power_target(x_axis, y_axis, target_field_info, efficiency_curve):
+    """
+    Build a k-space target map for cylindrically symmetric angular emission.
+
+    The target is a radial weighting function on the top monitor's angular
+    spectrum. It integrates the full azimuthal direction for each theta instead
+    of enforcing a coherent real-space beam template.
+    """
+    x = np.ravel(np.asarray(x_axis, dtype=float))
+    y = np.ravel(np.asarray(y_axis, dtype=float))
+    if x.size < 2 or y.size < 2:
+        raise ValueError("angular target requires at least two x/y monitor samples")
+
+    dx = float(np.mean(np.diff(x)))
+    dy = float(np.mean(np.diff(y)))
+    if dx == 0.0 or dy == 0.0:
+        raise ValueError("angular target requires nonzero x/y monitor spacing")
+
+    nx = x.size
+    ny = y.size
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=abs(dx))
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=abs(dy))
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+
+    wavelength_m = float(target_field_info["wavelength_um"]) * 1e-6
+    k0 = 2.0 * np.pi / wavelength_m
+    normalized_kr = np.sqrt(KX ** 2 + KY ** 2) / k0
+    propagating = normalized_kr <= 1.0
+    theta_grid_deg = np.rad2deg(np.arcsin(np.clip(normalized_kr, 0.0, 1.0)))
+
+    angle_points, efficiency_points = nonnegative_efficiency_curve_arrays(efficiency_curve)
+    target_map = np.interp(
+        theta_grid_deg,
+        angle_points,
+        efficiency_points,
+        left=efficiency_points[0],
+        right=efficiency_points[-1],
+    )
+    max_target = float(np.max(np.abs(target_map)))
+    if max_target > 0.0:
+        target_map = target_map / max_target
+    target_map = np.where(propagating, target_map, 0.0)
+
+    if angular_flux_cosine_weight:
+        flux_weight = np.sqrt(np.clip(1.0 - normalized_kr ** 2, 0.0, 1.0))
+    else:
+        flux_weight = np.ones_like(normalized_kr)
+    flux_weight = np.where(propagating, flux_weight, 0.0)
+
+    zero_mask = angular_bin_mask(
+        theta_grid_deg,
+        0.0,
+        angular_diagnostic_bin_half_width_deg,
+        propagating,
+    )
+    target0 = float(np.interp(0.0, angle_points, efficiency_points))
+    target0 = max(target0, 1e-12)
+    ratio_match_masks = []
+    ratio_target_values = []
+    for angle_deg, efficiency in zip(angle_points, efficiency_points):
+        angle_deg = float(angle_deg)
+        if angle_deg <= 1e-12:
+            continue
+        ratio_match_masks.append(
+            {
+                "theta_deg": angle_deg,
+                "mask": angular_bin_mask(
+                    theta_grid_deg,
+                    angle_deg,
+                    angular_diagnostic_bin_half_width_deg,
+                    propagating,
+                ),
+            }
+        )
+        ratio_target_values.append(float(efficiency) / target0)
+
+    diagnostic_ring_masks = []
+    for radial_order, theta_deg, _eff, _amp in target_field_info["radial_orders"]:
+        diagnostic_ring_masks.append(
+            {
+                "order": int(radial_order),
+                "theta_deg": float(theta_deg),
+                "mask": angular_bin_mask(
+                    theta_grid_deg,
+                    theta_deg,
+                    angular_diagnostic_bin_half_width_deg,
+                    propagating,
+                ),
+            }
+        )
+
+    if angular_use_hann_window:
+        window = np.outer(np.hanning(nx), np.hanning(ny))
+    else:
+        window = np.ones((nx, ny), dtype=float)
+
+    return {
+        "x_size": nx,
+        "y_size": ny,
+        "dft_x": build_dft_matrix(nx),
+        "dft_y": build_dft_matrix(ny),
+        "kx": kx,
+        "ky": ky,
+        "theta_grid_deg": theta_grid_deg,
+        "target_map": np.asarray(target_map, dtype=float),
+        "propagating": np.asarray(propagating, dtype=float),
+        "flux_weight": np.asarray(flux_weight, dtype=float),
+        "window": np.asarray(window, dtype=float),
+        "angle_points": angle_points,
+        "efficiency_points": efficiency_points,
+        "zero_angle_mask": zero_mask,
+        "ratio_match_masks": ratio_match_masks,
+        "ratio_target_values": np.asarray(ratio_target_values, dtype=float),
+        "diagnostic_ring_masks": diagnostic_ring_masks,
+    }
+
+
+def save_angular_power_target_preview(angular_target, design_dir, file_prefix="LDOS_angular_target"):
+    kx = np.asarray(angular_target["kx"], dtype=float)
+    ky = np.asarray(angular_target["ky"], dtype=float)
+    target_map = np.asarray(angular_target["target_map"], dtype=float)
+    theta_grid = np.asarray(angular_target["theta_grid_deg"], dtype=float)
+    extent = (kx[0], kx[-1], ky[0], ky[-1])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    im0 = axes[0].imshow(
+        target_map.T,
+        origin="lower",
+        extent=extent,
+        aspect="equal",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=max(float(np.max(target_map)), 1.0),
+    )
+    axes[0].set_title("Angular target weight")
+    axes[0].set_xlabel("kx (1/m)")
+    axes[0].set_ylabel("ky (1/m)")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+    im1 = axes[1].imshow(
+        theta_grid.T,
+        origin="lower",
+        extent=extent,
+        aspect="equal",
+        cmap="magma",
+        vmin=0.0,
+        vmax=90.0,
+    )
+    axes[1].set_title("Polar angle theta")
+    axes[1].set_xlabel("kx (1/m)")
+    axes[1].set_ylabel("ky (1/m)")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    path = os.path.join(design_dir, f"{file_prefix}.png")
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    np.save(os.path.join(design_dir, f"{file_prefix}_map.npy"), target_map)
+    print(f"[ldos setup] saved angular target map: {path}")
+
+
+def expand_xy_weight(weight_xy, target_ndim):
+    weight = npa.asarray(weight_xy)
+    while weight.ndim < target_ndim:
+        weight = weight[..., None]
+    return weight
+
+
+def dft2_xy(field, angular_target):
+    dft_x = npa.asarray(angular_target["dft_x"])
+    dft_y = npa.asarray(angular_target["dft_y"])
+    return npa.einsum("ia,jb,ab...->ij...", dft_x, dft_y, field)
+
+
+def compute_angular_power_metrics(Ex, Ey, Ez, angular_target):
+    nx = int(angular_target["x_size"])
+    ny = int(angular_target["y_size"])
+    spectrum_xy = 0.0
+
+    for field in (Ex, Ey, Ez):
+        if field.shape[0] != nx or field.shape[1] != ny:
+            raise ValueError(
+                f"angular target shape mismatch: field={field.shape}, target=({nx}, {ny})"
+            )
+        field = field * expand_xy_weight(angular_target["window"], field.ndim)
+        spectrum = npa.abs(dft2_xy(field, angular_target)) ** 2
+        if spectrum.ndim > 2:
+            spectrum = npa.sum(spectrum, axis=tuple(range(2, spectrum.ndim)))
+        spectrum_xy = spectrum_xy + spectrum
+
+    weighted_spectrum = spectrum_xy * npa.asarray(angular_target["flux_weight"])
+    top_power = npa.sum(weighted_spectrum * npa.asarray(angular_target["propagating"]))
+    zero_power = npa.sum(weighted_spectrum * npa.asarray(angular_target["zero_angle_mask"]))
+    ratio_powers = [
+        npa.sum(weighted_spectrum * npa.asarray(entry["mask"]))
+        for entry in angular_target["ratio_match_masks"]
+    ]
+    ring_powers = [
+        npa.sum(weighted_spectrum * npa.asarray(entry["mask"]))
+        for entry in angular_target["diagnostic_ring_masks"]
+    ]
+    return top_power, zero_power, ratio_powers, ring_powers
+
+
+def compute_monitor_angular_metrics(monitor_result, angular_target):
+    E = np.asarray(monitor_result["E"], dtype=np.complex128)
+    if E.shape[-1] != 3:
+        raise ValueError(f"unexpected monitor E shape {E.shape}")
+    top_power, zero_power, ratio_powers, ring_powers = compute_angular_power_metrics(
+        E[..., 0],
+        E[..., 1],
+        E[..., 2],
+        angular_target,
+    )
+    return (
+        float(np.real(top_power)),
+        float(np.real(zero_power)),
+        [float(np.real(power)) for power in ratio_powers],
+        [float(np.real(power)) for power in ring_powers],
+    )
 
 
 
 # Setup dipole-based channels
 target_channels = []
-for dipole_idx, (dipole_x, dipole_y, dipole_z) in enumerate(dipole_positions):
+for dipole_idx, ((dipole_x, dipole_y, dipole_z), dipole_pol, dipole_weight) in enumerate(
+    zip(dipole_positions, dipole_polarizations, dipole_weights)
+):
     target_channels.append({
-        "name": f"dipole_{dipole_idx}_pos_({dipole_x:.3f},{dipole_y:.3f})",
+        "name": f"dipole_{dipole_idx}_pos_({dipole_x:.3f},{dipole_y:.3f})_{dipole_pol}",
         "dipole_idx": dipole_idx,
         "dipole_x": dipole_x,
         "dipole_y": dipole_y,
         "dipole_z": dipole_z,
-        "efficiency_curve": target_efficiency_curve,  # Reference to efficiency curve
-        "polarization": dipole_polarization,
+        "polarization": dipole_pol,
+        "weight": float(dipole_weight),
         "wavelengths": np.asarray(visible_wavelengths, dtype=float),
     })
 
 N_fom = len(target_channels)
+channel_weights = np.asarray([channel["weight"] for channel in target_channels], dtype=float)
 combined_fom_history = []
 
 # FoM control parameters
-ldos_field_match_weight = float(os.environ.get("MSOPT_OLED_LDOS_FIELD_MATCH_WEIGHT", "1.0"))
-ldos_efficiency_weight = float(os.environ.get("MSOPT_OLED_LDOS_EFFICIENCY_WEIGHT", "1.0"))
+ldos_ratio_match_weight = float(
+    os.environ.get(
+        "MSOPT_OLED_RATIO_MATCH_WEIGHT",
+        os.environ.get(
+            "MSOPT_OLED_ANGULAR_SHAPE_WEIGHT",
+            os.environ.get("MSOPT_OLED_LDOS_FIELD_MATCH_WEIGHT", "1.0"),
+        ),
+    )
+)
+ldos_zero_emission_weight = float(
+    os.environ.get(
+        "MSOPT_OLED_ZERO_EMISSION_WEIGHT",
+        os.environ.get("MSOPT_OLED_LDOS_EFFICIENCY_WEIGHT", "1.0"),
+    )
+)
+ldos_score_cap = float(os.environ.get("MSOPT_OLED_LDOS_SCORE_CAP", "10.0"))
 channel_power_floor = float(os.environ.get("MSOPT_OLED_CHANNEL_POWER_FLOOR", "1e-12"))
 unstable_candidate_fom = float(os.environ.get("MSOPT_OLED_UNSTABLE_CANDIDATE_FOM", "-1e30"))
 
@@ -472,10 +880,9 @@ def real_scalar_or_none(value):
 
 
 def binarization_fraction_from_design(X):
-    rho = np.asarray(npa.clip(X, 0.0, 1.0), dtype=float).ravel()
-    if rho.size == 0:
+    if X.size == 0:
         return 1.0
-    return float(np.mean((rho <= 1e-3) | (rho >= 1.0 - 1e-3)))
+    return float(np.mean((X <= 1e-3) | (X >= 1.0 - 1e-3)))
 
 
 def penalty_ramp_fraction(binarization_fraction):
@@ -499,68 +906,50 @@ def update_ldos_penalty_weights(X):
     return current_binarization_fraction
 
 
-def compute_ldos_field_match_score(Ex, Ey, Ez, channel, eml_c, eml_s):
+def compute_angular_power_scores(Ex, Ey, Ez, channel):
     """
-    Compute LDOS field matching score against target field pattern.
-    
-    Args:
-        Ex, Ey, Ez: Electric field components
-        channel: Channel configuration dictionary
-        eml_c: EML center coordinates
-        eml_s: EML size
-        
-    Returns:
-        Field matching score (0 to 1, higher is better)
-    """
-    # For x-polarized dipole, focus on Ex component
-    E_field = Ex
-    
-    # Compute spatial average intensity
-    E_field = npa.where(npa.isfinite(E_field), E_field, 0.0)
-    intensity = npa.abs(E_field) ** 2
-    
-    # Spatial uniformity metric (how well-confined to EML)
-    mean_intensity = npa.mean(intensity)
-    variance = npa.mean(intensity ** 2) - mean_intensity ** 2
-    uniformity = mean_intensity / (npa.sqrt(variance) + 1e-30)
-    
-    # Spatial confinement score
-    confinement_score = npa.sqrt(mean_intensity) * npa.exp(-0.01 * variance)
-    
-    return confinement_score
+    Compute cylindrically averaged angular emission scores from the top monitor.
 
-
-def compute_ldos_emission_efficiency(Ex, Ey, Ez, channel):
-    """
-    Compute radiation efficiency from dipole LDOS against target efficiency curve.
-    
-    Args:
-        Ex, Ey, Ez: Electric field components at EML plane
-        channel: Channel configuration dictionary with efficiency_curve
-        
     Returns:
-        Efficiency score (0 to 1, higher is better)
+        zero_emission: 0-degree bin power normalized to the bulk 0-degree reference
+        ratio_match: normalized overlap between measured and target P(theta)/P0 ratios
+        ratio_error: diagnostic mean squared ratio mismatch
+        ring_powers: diagnostic power in each configured radial diffraction ring
     """
-    # x-polarized dipole couples primarily to Ex at EML
-    E_field = Ex
-    E_field = npa.where(npa.isfinite(E_field), E_field, 0.0)
-    
-    # Total radiated power (proportional to field intensity)
-    radiated_power = npa.sum(npa.abs(E_field) ** 2)
-    
-    # Get target efficiency at reference angle (0 degrees = normal emission)
-    # This represents the baseline efficiency we're optimizing toward
-    efficiency_curve = channel["efficiency_curve"]
-    target_eff_baseline = interpolate_efficiency_at_angle(0.0, efficiency_curve)
-    
-    # Efficiency score: how well we meet target radiated power
-    # Normalized to baseline efficiency at 0 degrees
-    efficiency_score = npa.minimum(
-        radiated_power / (max(target_eff_baseline, 1e-10) + 1e-30),
-        1.0
+    angular_target = channel.get("angular_target")
+    if angular_target is None:
+        raise ValueError("angular_target is missing from the channel configuration")
+
+    _top_power, zero_power, ratio_powers, ring_powers = compute_angular_power_metrics(
+        Ex,
+        Ey,
+        Ez,
+        angular_target,
     )
-    
-    return efficiency_score
+    zero_power = npa.maximum(npa.where(npa.isfinite(zero_power), zero_power, 0.0), channel_power_floor)
+    bulk_zero_ref = max(float(channel.get("bulk_zero_power_ref", 1.0)), channel_power_floor)
+
+    ratio_error = 0.0
+    ratio_count = 0
+    ratio_dot = 1.0
+    ratio_norm = 1.0
+    target_norm = 1.0
+    for ratio_power, target_ratio in zip(ratio_powers, angular_target["ratio_target_values"]):
+        ratio_power = npa.maximum(npa.where(npa.isfinite(ratio_power), ratio_power, 0.0), 0.0)
+        ratio = ratio_power / (zero_power + 1e-30)
+        target_ratio = float(target_ratio)
+        ratio_error = ratio_error + (ratio - target_ratio) ** 2
+        ratio_dot = ratio_dot + ratio * target_ratio
+        ratio_norm = ratio_norm + ratio ** 2
+        target_norm = target_norm + target_ratio ** 2
+        ratio_count += 1
+    if ratio_count > 0:
+        ratio_error = ratio_error / float(ratio_count)
+
+    ratio_error = npa.maximum(ratio_error, 0.0)
+    ratio_match = ratio_dot ** 2 / (ratio_norm * target_norm + 1e-30)
+    zero_emission = npa.maximum(zero_power / (bulk_zero_ref + 1e-30), 0.0)
+    return zero_emission, ratio_match, ratio_error, ring_powers
 
 
 
@@ -575,9 +964,15 @@ def combine_ldos_fom_from_values(vals):
         Combined scalar FoM value
     """
     vals = npa.maximum(npa.where(npa.isfinite(vals), vals, 0.0), channel_power_floor)
-    
-    # Average LDOS across all dipole positions
-    combined_fom = npa.mean(vals)
+    weights = npa.asarray(channel_weights, dtype=float)
+    weight_sum = npa.sum(weights)
+    if float(weight_sum) > 0.0:
+        weights = weights / weight_sum
+    else:
+        weights = npa.ones_like(weights) / max(float(weights.size), 1.0)
+
+    # Weighted average across the configured dipole samples.
+    combined_fom = npa.sum(vals * weights)
     
     return combined_fom
 
@@ -595,9 +990,17 @@ def ldos_summary_from_values(vals):
     vals = np.nan_to_num(np.asarray(vals, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
     vals = np.maximum(vals, channel_power_floor)
     
+    weight_sum = float(np.sum(channel_weights))
+    if weight_sum > 0.0:
+        normalized_weights = channel_weights / weight_sum
+        weighted_mean = float(np.sum(vals * normalized_weights))
+    else:
+        weighted_mean = float(np.mean(vals))
+
     return {
         "dipole_foms": vals,
         "mean_fom": float(np.mean(vals)),
+        "weighted_mean_fom": weighted_mean,
         "min_fom": float(np.min(vals)),
         "max_fom": float(np.max(vals)),
     }
@@ -631,7 +1034,7 @@ def build_optimization_problem():
     Build dipole-based LDOS optimization problem with multiple dipole positions.
     
     Each dipole position (center, 0.4R, 0.8R) gets its own simulator and optimization instance.
-    Forward simulations: dipole excitation -> collect field at EML
+    Forward simulations: EML dipole excitation -> collect field at the upper-air target plane.
     Adjoint: backpropagate from design region to maximize coupling
     """
     # Compute and visualize target field information
@@ -646,13 +1049,14 @@ def build_optimization_problem():
     fom_history = [[] for _ in range(N_fom)]
     sim = [None] * N_fom
     opt = [None] * N_fom
+    use_bulk_normalization = env_flag("MSOPT_OLED_BULK_NORMALIZATION", "1")
 
     for idx, channel in enumerate(target_channels):
         dipole_x = channel["dipole_x"]
         dipole_y = channel["dipole_y"]
         dipole_z = channel["dipole_z"]
         
-        # Create simulator with PML on all sides (no reciprocal radiation source)
+        # Create simulator with selected lateral BC and absorbing z boundaries.
         sim[idx] = ms.Lumerical_utill.LumericalFDTDSimulator(
             sim_size=[Sx, Sy, Sz],
             resolution=resolution,
@@ -660,26 +1064,69 @@ def build_optimization_problem():
             background_index=background_index,
             center_wl=float(np.mean(visible_wavelengths)),
             N_f=len(visible_wavelengths),
-            bc_x="PML",
-            bc_y="PML",
+            bc_x=bc_xy,
+            bc_y=bc_xy,
             bc_z="PML",
         )
 
-        # Add dipole source at specified position
-        # Use x-polarized dipole
+        # Add dipole source at the configured position and polarization.
+        theta_deg, phi_deg = dipole_orientation_angles(channel["polarization"])
         sim[idx].fdtd.adddipole()
-        sim[idx].fdtd.set("name", f"dipole_{idx}")
+        sim[idx].fdtd.set("name", f"source")
         sim[idx].fdtd.set("x", dipole_x * 1e-6)
         sim[idx].fdtd.set("y", dipole_y * 1e-6)
         sim[idx].fdtd.set("z", dipole_z * 1e-6)
-        sim[idx].fdtd.set("theta", 90.0)  # x-polarized (perpendicular to z)
-        sim[idx].fdtd.set("phi", 0.0)
+        sim[idx].fdtd.set("theta", theta_deg)
+        sim[idx].fdtd.set("phi", phi_deg)
         sim[idx].fdtd.set("wavelength start", float(np.min(visible_wavelengths)) * 1e-6)
         sim[idx].fdtd.set("wavelength stop", float(np.max(visible_wavelengths)) * 1e-6)
 
+        # The objective is the emitted field in the upper air region, not the
+        # near field on the EML source plane.
+        sim[idx].add_monitor(name=target_monitor_name, center=target_monitor_c, size=target_monitor_s)
+
+        # Measure a bulk-reference emission level before adding the OLED stack.
+        # This acts as the LDOS normalization term requested by the user.
+        if use_bulk_normalization:
+            sim[idx].run(name=f"bulk_reference_{idx}", save=True)
+            bulk_result = sim[idx].fdtd.getresult(target_monitor_name, "E")
+            bulk_x = np.ravel(np.asarray(bulk_result["x"], dtype=float))
+            bulk_y = np.ravel(np.asarray(bulk_result["y"], dtype=float))
+            channel["angular_target"] = build_angular_power_target(
+                bulk_x,
+                bulk_y,
+                target_field_info,
+                target_efficiency_curve,
+            )
+            bulk_top_power, bulk_zero_power, bulk_ratio_powers, bulk_ring_powers = compute_monitor_angular_metrics(
+                bulk_result,
+                channel["angular_target"],
+            )
+            channel["bulk_top_power_ref"] = max(bulk_top_power, channel_power_floor)
+            channel["bulk_zero_power_ref"] = max(bulk_zero_power, channel_power_floor)
+            channel["bulk_ratio_powers"] = bulk_ratio_powers
+            channel["bulk_ring_powers"] = bulk_ring_powers
+            if idx == 0:
+                save_angular_power_target_preview(
+                    channel["angular_target"],
+                    design_dir,
+                    file_prefix="LDOS_angular_target",
+                )
+            sim[idx].fdtd.switchtolayout()
+            print(
+                f"[ldos setup] channel {idx} bulk P0 reference="
+                f"{channel['bulk_zero_power_ref']:.6e}, "
+                f"bulk top reference={channel['bulk_top_power_ref']:.6e}"
+            )
+        else:
+            channel["bulk_top_power_ref"] = 1.0
+            channel["bulk_zero_power_ref"] = 1.0
+            channel["bulk_ratio_powers"] = []
+            channel["angular_target"] = None
+
         # Add OLED stack
         add_oled_stack(sim[idx], float(np.mean(visible_wavelengths)))
-        
+
         # Add design grating
         sim[idx].add_design_grid(
             name="design",
@@ -691,29 +1138,52 @@ def build_optimization_problem():
             density=grating_initial_density * np.ones(design_grids),
             wavelength=float(np.mean(visible_wavelengths)),
         )
-        
+
         # Add design monitor for adjoint
         sim[idx].add_design_monitor()
-        
-        # Add EML field monitor for FoM evaluation
-        sim[idx].add_monitor(name="eml_monitor", center=eml_c, size=eml_s)
 
-        # Define objective function: LDOS-based FoM
+        # Ensure source wavelengths are defined before adding the monitor
+        if not hasattr(sim[idx], "src_wl") or sim[idx].src_wl is None:
+            sim[idx].src_wl = np.asarray(visible_wavelengths, dtype=float).reshape(-1) * sim[idx].unit
+            sim[idx].src_bw = 0.0
+        
+        # Define objective function: angular-power LDOS FoM
         def J_ldos(E_x, E_y, E_z, channel_idx=idx, channel=channel):
             """
-            Objective function combining field matching and efficiency.
+            Objective function combining 0-degree emission and angular ratio matching.
             
-            FoM = (field matching score) * (efficiency score)
+            FoM = (bulk-normalized P0 ** zero_emission_weight)
+                  * (P(theta)/P0 ratio match ** ratio_match_weight).
             """
-            # Field matching score (confinement to EML)
-            field_match = compute_ldos_field_match_score(E_x, E_y, E_z, channel, eml_c, eml_s)
-            
-            # Emission efficiency score
-            efficiency = compute_ldos_emission_efficiency(E_x, E_y, E_z, channel)
+            angular_target = channel.get("angular_target")
+            if angular_target is None:
+                x_axis = getattr(opt[channel_idx], "xg", None)
+                y_axis = getattr(opt[channel_idx], "yg", None)
+                if x_axis is None or y_axis is None:
+                    raise ValueError("angular target is not initialized")
+                angular_target = build_angular_power_target(
+                    x_axis,
+                    y_axis,
+                    target_field_info,
+                    target_efficiency_curve,
+                )
+                channel["angular_target"] = angular_target
+
+            zero_emission, ratio_match, ratio_error, _ring_powers = compute_angular_power_scores(
+                E_x,
+                E_y,
+                E_z,
+                channel,
+            )
             
             # Combined FoM
-            fom = ldos_field_match_weight * field_match + ldos_efficiency_weight * efficiency
-            fom = npa.maximum(fom, channel_power_floor)
+            zero_emission = npa.clip(zero_emission, 0.0, ldos_score_cap)
+            ratio_match = npa.clip(ratio_match, 0.0, 1.0)
+            fom = npa.power(zero_emission, ldos_zero_emission_weight) * npa.power(
+                ratio_match,
+                ldos_ratio_match_weight,
+            )
+            fom = npa.clip(fom, 0.0, ldos_score_cap)
             
             fom_value = real_scalar_or_none(fom)
             if fom_value is not None:
@@ -721,8 +1191,12 @@ def build_optimization_problem():
                 print(
                     f"[dipole {channel_idx}] {channel['name']} "
                     f"pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f},{channel['dipole_z']:.3f}) "
+                    f"pol={channel['polarization']} "
+                    f"w={channel['weight']:.3f} "
                     f"FoM={fom:.6e} "
-                    f"(field_match={field_match:.6e}, efficiency={efficiency:.6e})"
+                    f"(P0_norm={zero_emission:.6e}, "
+                    f"ratio_match={ratio_match:.6e}, "
+                    f"ratio_error={ratio_error:.6e})"
                 )
             
             return fom
@@ -732,14 +1206,18 @@ def build_optimization_problem():
             sim[idx],
             objective_functions=[J_ldos],
             objective_arguments=[0, 1, 2],  # Ex, Ey, Ez
-            FoM_size=eml_s,
-            FoM_center=eml_c,
-            adj_fwd=True,
+            FoM_size=target_monitor_s,
+            FoM_center=target_monitor_c,
+            adj_fwd=False,
             opt_idx=idx,
             broadband_adjoint=True,
         )
         
-        print(f"[dipole setup] channel {idx}: {channel['name']} at position {dipole_x:.3f}, {dipole_y:.3f}")
+        print(
+            f"[dipole setup] channel {idx}: {channel['name']} "
+            f"pos=({dipole_x:.3f},{dipole_y:.3f},{dipole_z:.3f}) "
+            f"pol={channel['polarization']} w={channel['weight']:.3f}"
+        )
     
     return sim, opt, fom_history
 
@@ -788,6 +1266,26 @@ def make_adjoint_loop(opt):
         Returns:
             FoM values and gradients for all dipoles
         """
+        if Case == 3:
+            dJ_dus = X[0]
+            vals = np.asarray([
+                max(float(np.nan_to_num(np.real(v[0] if isinstance(v, (list, tuple, np.ndarray)) else v))), channel_power_floor)
+                for v in N_cases
+            ], dtype=float)
+            vals = npa.maximum(npa.where(npa.isfinite(vals), vals, 0.0), channel_power_floor)
+            coeffs = ag_jacobian(combine_ldos_fom_from_values)(vals)
+            coeffs = npa.where(npa.isfinite(coeffs), coeffs, 0.0)
+
+            grad = 0.0
+            for coeff, channel_grad in zip(coeffs, dJ_dus):
+                channel_grad = npa.where(npa.isfinite(npa.array(channel_grad)), npa.array(channel_grad), 0.0)
+                grad += coeff * channel_grad
+            grad = npa.where(npa.isfinite(grad), grad, 0.0)
+
+            print(f"[ldos] combined grad mean: {np.mean(np.abs(grad)):.6e}")
+            print(f"[ldos] combined grad max: {np.max(np.abs(grad)):.6e}")
+            return grad
+
         update_ldos_penalty_weights(X)
         
         f0s = [0] * N_fom
@@ -893,13 +1391,16 @@ def make_adjoint_loop(opt):
         for idx, channel in enumerate(target_channels):
             print(
                 f"[ldos] dipole_{idx} {channel['name']} "
-                f"pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f}) "
+                f"pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f},{channel['dipole_z']:.3f}) "
+                f"pol={channel['polarization']} "
+                f"w={channel['weight']:.3f} "
                 f"FoM={f0_vals[idx]:.6e}"
             )
         
         print(
             f"[ldos] combined LDOS FoM: {f0:.6e} "
-            f"(mean={summary['mean_fom']:.6e}, min={summary['min_fom']:.6e}, "
+            f"(mean={summary['mean_fom']:.6e}, weighted_mean={summary['weighted_mean_fom']:.6e}, "
+            f"min={summary['min_fom']:.6e}, "
             f"max={summary['max_fom']:.6e}, binarization={current_binarization_fraction:.3f})"
         )
 
@@ -907,28 +1408,7 @@ def make_adjoint_loop(opt):
         if Case:
             if isinstance(X, str):
                 return dJ_dus
-            
-            # Average gradients across all dipole positions
-            combined_grad = np.mean([
-                np.asarray(grad, dtype=float).flatten()
-                for grad in dJ_dus
-            ], axis=0)
-            
-            # Apply Jacobian for combined FoM
-            coeffs = ag_jacobian(combine_ldos_fom_from_values)(f0_vals)
-            coeffs = npa.where(npa.isfinite(coeffs), coeffs, 0.0)
-            
-            final_grad = np.zeros_like(combined_grad)
-            for idx, (coeff, grad) in enumerate(zip(coeffs, dJ_dus)):
-                grad_arr = np.asarray(grad, dtype=float).flatten()
-                final_grad += float(coeff) * grad_arr
-            
-            final_grad = npa.where(npa.isfinite(final_grad), final_grad, 0.0)
-            
-            print(f"[ldos] combined grad mean: {np.mean(np.abs(final_grad)):.6e}")
-            print(f"[ldos] combined grad max: {np.max(np.abs(final_grad)):.6e}")
-            
-            return f0, f0s, final_grad
+            return f0, f0s, dJ_dus
         
         return f0, f0s
 
@@ -942,8 +1422,9 @@ if __name__ == "__main__":
         channel = target_channels[channel_idx]
         print(f"[ldos session test] channel {channel_idx}: {channel['name']}")
         print(
-            f"[ldos session test] dipole_pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f}), "
-            f"efficiency_curve={target_efficiency_curve_str}, pol={channel['polarization']}"
+            f"[ldos session test] dipole_pos=({channel['dipole_x']:.3f},{channel['dipole_y']:.3f},{channel['dipole_z']:.3f}), "
+            f"efficiency_curve={target_efficiency_curve_str}, "
+            f"pol={channel['polarization']}"
         )
         raise SystemExit(0)
 
@@ -960,9 +1441,15 @@ if __name__ == "__main__":
         f"bottom_air_pad={air_bot_h} um, background_index={background_index}"
     )
     print(
-        "Dipole-based LDOS channels (3 positions): "
+        f"Dipole sample config ({n_dipole_positions} samples): "
+        f"r_frac={dipole_radii_frac}, azimuth_deg={dipole_azimuths_deg}, "
+        f"pol={dipole_polarizations}, weights={dipole_weights.tolist()}"
+    )
+    print(
+        "Dipole-based LDOS channels: "
         + ", ".join(
-            f"{ch['name']} pos=({ch['dipole_x']:.3f},{ch['dipole_y']:.3f})"
+            f"{ch['name']} pos=({ch['dipole_x']:.3f},{ch['dipole_y']:.3f},{ch['dipole_z']:.3f}) "
+            f"pol={ch['polarization']} w={ch['weight']:.3f}"
             for ch in target_channels
         )
     )
@@ -972,21 +1459,34 @@ if __name__ == "__main__":
         f"radial_grating_shape=({radial_design_grids},), design_parameters={design_parameters}, "
         f"radial_radius={radial_design_radius}"
     )
-    print("boundary_mode=PML (all sides), dipole excitation, field confinement optimization")
     print(
-        "FoM = (field_matching_score) * (efficiency_score) averaged across all dipole positions; "
-        "field matching focuses on EML confinement, efficiency on target radiation"
+        f"boundary_mode={boundary_label}, bc_x={bc_xy}, bc_y={bc_xy}, bc_z=PML, "
+        "dipole excitation, angular-power optimization"
+    )
+    print(
+        "FoM = weighted average across dipoles of "
+        "(bulk-normalized 0deg power ** zero_emission_weight) "
+        "* (angular ratio match ** ratio_match_weight)"
     )
     print(f"visible_wavelengths={visible_wavelengths}")
-    print(f"EML FoM plane center={eml_c}, size={eml_s}")
     print(
-        f"FoM control weights: field_match={ldos_field_match_weight}, "
-        f"efficiency={ldos_efficiency_weight}"
+        f"Target FoM monitor={target_monitor_name}, center={target_monitor_c}, "
+        f"size={target_monitor_s}"
+    )
+    print(f"Dipole source plane center={eml_c}, sampled in EML")
+    print(
+        f"FoM control weights: zero_emission={ldos_zero_emission_weight}, "
+        f"ratio_match={ldos_ratio_match_weight}, "
+        f"score_cap={ldos_score_cap}, "
+        f"cosine_flux_weight={angular_flux_cosine_weight}, "
+        f"hann_window={angular_use_hann_window}"
     )
     print(
         "Postprocess settings: "
         f"MSOPT_OLED_POSTPROCESS={env_flag('MSOPT_OLED_POSTPROCESS', '1')}, "
-        f"MSOPT_OLED_POSTPROCESS_ONLY={env_flag('MSOPT_OLED_POSTPROCESS_ONLY', '0')}"
+        f"MSOPT_OLED_POSTPROCESS_ONLY={env_flag('MSOPT_OLED_POSTPROCESS_ONLY', '0')}, "
+        f"MSOPT_OLED_BULK_NORMALIZATION={env_flag('MSOPT_OLED_BULK_NORMALIZATION', '1')}, "
+        f"MSOPT_OLED_LDOS_POSTPROCESS_RANDOM_POLARIZATION={env_flag('MSOPT_OLED_LDOS_POSTPROCESS_RANDOM_POLARIZATION', '1')}"
     )
 
     postprocess_only = env_flag("MSOPT_OLED_POSTPROCESS_ONLY", "0")
@@ -998,7 +1498,7 @@ if __name__ == "__main__":
             dJ_0,
             Born_k=50,
             Initial_LR=0.2,
-            Raw=True,
+            Raw=False,
         )
         optimizer.flag = True
         optimizer(mapping, N_fom, make_adjoint_loop(opt))
@@ -1043,7 +1543,7 @@ if __name__ == "__main__":
 
             def get_angular_spectrum_from_monitor(sim, monitor_name, wavelength_um):
                 """
-                Extract angular spectrum (k-space) from EML monitor via FFT.
+                Extract angular spectrum (k-space) from the upper-air target monitor via FFT.
                 Returns angles and power spectrum.
                 """
                 result = sim.fdtd.getresult(monitor_name, "E")
@@ -1089,22 +1589,36 @@ if __name__ == "__main__":
                 theta_deg = np.rad2deg(np.arcsin(np.clip(normalized_kr, 0.0, 1.0)))
                 
                 # Extract angle-resolved power
+                if angular_flux_cosine_weight:
+                    spectrum = spectrum * np.sqrt(np.clip(1.0 - normalized_kr ** 2, 0.0, 1.0))
                 spectrum = np.where(propagating, spectrum, 0.0)
                 return theta_deg, spectrum
 
-            def sample_angles_from_spectrum(theta_deg, spectrum, angles_to_sample):
-                """Sample spectrum at specific angles."""
-                samples = {}
-                for target_angle in angles_to_sample:
-                    metric = np.abs(theta_deg - target_angle)
-                    idx = np.unravel_index(np.nanargmin(metric), metric.shape)
-                    samples[float(target_angle)] = float(np.sum(spectrum))  # Total power
-                return samples
+            def integrate_annular_angle_profile(theta_deg, spectrum, angle_centers_deg):
+                """Integrate all azimuthal k-space pixels in each theta bin."""
+                centers = np.asarray(angle_centers_deg, dtype=float)
+                if centers.size == 0:
+                    return np.asarray([], dtype=float)
+                if centers.size == 1:
+                    edges = np.asarray([0.0, 90.0], dtype=float)
+                else:
+                    mids = 0.5 * (centers[:-1] + centers[1:])
+                    edges = np.concatenate(([0.0], mids, [90.0]))
+                powers = []
+                for idx, center in enumerate(centers):
+                    lo = edges[idx]
+                    hi = edges[idx + 1]
+                    if idx == centers.size - 1:
+                        mask = (theta_deg >= lo) & (theta_deg <= hi)
+                    else:
+                        mask = (theta_deg >= lo) & (theta_deg < hi)
+                    powers.append(float(np.sum(np.asarray(spectrum)[mask])))
+                return np.asarray(powers, dtype=float)
 
             def run_ldos_dipole_postprocess(final_design, n_samples=20):
                 """
                 Run postprocess with n_samples random dipoles.
-                Compute incoherent emission pattern and overlap with target field.
+                Compute the incoherent, azimuth-integrated angular emission pattern.
                 """
                 print(f"[postprocess] Loading final design and setting up simulator...")
                 try:
@@ -1120,13 +1634,16 @@ if __name__ == "__main__":
                     period_um=float(window_x),
                     efficiency_curve=target_efficiency_curve,
                 )
-                target_spectrum = target_field_info["target_spectrum"]
-                diffraction_angles = np.array([angle for _, angle in target_field_info["diffraction_orders"]])
-
-                # Generate random dipole positions (20 samples in EML)
-                n_dipoles = int(os.environ.get("MSOPT_OLED_LDOS_POSTPROCESS_N_DIPOLES", "20"))
+                # Generate random dipole positions in the EML.
+                n_dipoles = int(os.environ.get("MSOPT_OLED_LDOS_POSTPROCESS_N_DIPOLES", str(n_samples)))
                 print(f"[postprocess] Generating {n_dipoles} random dipole positions in EML...")
                 active_radius = 0.5 * min(active_x, active_y)
+                random_postprocess_polarization = env_flag("MSOPT_OLED_LDOS_POSTPROCESS_RANDOM_POLARIZATION", "1")
+                fixed_postprocess_polarization = os.environ.get(
+                    "MSOPT_OLED_LDOS_POSTPROCESS_POLARIZATION",
+                    dipole_polarization,
+                ).strip().lower()
+                fixed_post_theta_deg, fixed_post_phi_deg = dipole_orientation_angles(fixed_postprocess_polarization)
                 np.random.seed(240)  # Reproducible
                 dipole_positions = []
                 for _ in range(n_dipoles):
@@ -1146,8 +1663,8 @@ if __name__ == "__main__":
                     background_index=background_index,
                     center_wl=float(np.mean(visible_wavelengths)),
                     N_f=len(visible_wavelengths),
-                    bc_x="PML",
-                    bc_y="PML",
+                    bc_x=bc_xy,
+                    bc_y=bc_xy,
                     bc_z="PML",
                 )
                 sim.src_wl = np.asarray(visible_wavelengths, dtype=float) * sim.unit
@@ -1162,7 +1679,7 @@ if __name__ == "__main__":
                     density=rho,
                     wavelength=float(np.mean(visible_wavelengths)),
                 )
-                sim.add_monitor(name="eml_monitor", center=eml_c, size=eml_s)
+                sim.add_monitor(name=target_monitor_name, center=target_monitor_c, size=target_monitor_s)
 
                 # Run simulations for all dipoles
                 print(f"[postprocess] Running {n_dipoles} dipole forward simulations...")
@@ -1178,14 +1695,20 @@ if __name__ == "__main__":
                     # Delete old dipole
                     delete_lumerical_object(sim.fdtd, "postprocess_dipole")
                     
-                    # Add x-polarized dipole
+                    # Add the configured dipole orientation.
                     sim.fdtd.adddipole()
                     sim.fdtd.set("name", "postprocess_dipole")
                     sim.fdtd.set("x", x * 1e-6)
                     sim.fdtd.set("y", y * 1e-6)
                     sim.fdtd.set("z", z * 1e-6)
-                    sim.fdtd.set("theta", 90.0)  # x-polarized
-                    sim.fdtd.set("phi", 0.0)
+                    if random_postprocess_polarization:
+                        sim.fdtd.set("theta", 90.0)
+                        phi_deg = float(np.random.uniform(0.0, 360.0))
+                        sim.fdtd.set("phi", phi_deg)
+                    else:
+                        phi_deg = fixed_post_phi_deg
+                        sim.fdtd.set("theta", fixed_post_theta_deg)
+                        sim.fdtd.set("phi", fixed_post_phi_deg)
                     sim.fdtd.set("wavelength start", float(np.min(visible_wavelengths)) * 1e-6)
                     sim.fdtd.set("wavelength stop", float(np.max(visible_wavelengths)) * 1e-6)
                     
@@ -1195,7 +1718,7 @@ if __name__ == "__main__":
                     try:
                         # Extract angular spectrum
                         theta_deg, spectrum = get_angular_spectrum_from_monitor(
-                            sim, "eml_monitor", float(np.mean(visible_wavelengths))
+                            sim, target_monitor_name, float(np.mean(visible_wavelengths))
                         )
                         total_power = float(np.sum(spectrum))
                         
@@ -1210,6 +1733,8 @@ if __name__ == "__main__":
                             "x": x,
                             "y": y,
                             "z": z,
+                            "theta_deg": 90.0 if random_postprocess_polarization else fixed_post_theta_deg,
+                            "phi_deg": phi_deg,
                             "total_power": total_power,
                             "spectrum": spectrum,
                         })
@@ -1220,6 +1745,8 @@ if __name__ == "__main__":
                             "x": x,
                             "y": y,
                             "z": z,
+                            "theta_deg": 90.0 if random_postprocess_polarization else fixed_post_theta_deg,
+                            "phi_deg": phi_deg,
                             "total_power": np.nan,
                             "spectrum": None,
                             "error": str(exc),
@@ -1236,19 +1763,14 @@ if __name__ == "__main__":
                     print("[postprocess] skipped: incoherent spectrum sum is zero or empty")
                     return None
 
-                # Normalize incoherent spectrum
-                incoherent_spectrum_normalized = incoherent_spectrum_sum / np.max(incoherent_spectrum_sum)
-
-                # Extract angle-resolved power from incoherent spectrum
+                # Extract azimuth-integrated angle-resolved power.
                 angle_resolution = int(os.environ.get("MSOPT_OLED_POSTPROCESS_ANGLE_RES", "181"))
-                angles_deg = np.linspace(-90.0, 90.0, angle_resolution)
-                angle_powers = []
-                for target_angle in angles_deg:
-                    metric = np.abs(theta_deg - target_angle)
-                    idx = np.unravel_index(np.nanargmin(metric), metric.shape)
-                    power = float(incoherent_spectrum_sum[idx])
-                    angle_powers.append(power)
-                angle_powers = np.asarray(angle_powers, dtype=float)
+                angles_deg = np.linspace(0.0, 90.0, angle_resolution)
+                angle_powers = integrate_annular_angle_profile(
+                    theta_deg,
+                    incoherent_spectrum_sum,
+                    angles_deg,
+                )
 
                 # Normalize to max
                 if np.max(angle_powers) > 0:
@@ -1261,6 +1783,10 @@ if __name__ == "__main__":
                     interpolate_efficiency_at_angle(float(angle), target_efficiency_curve)
                     for angle in angles_deg
                 ])
+                target_efficiency_zero = max(float(target_efficiency_at_angles[0]), 1e-12)
+                target_ratio_at_angles = target_efficiency_at_angles / target_efficiency_zero
+                zero_angle_power = max(float(angle_powers[0]), channel_power_floor)
+                angle_ratios_to_zero = angle_powers / (zero_angle_power + 1e-30)
 
                 # Save postprocess results
                 results_path = os.path.join(design_dir, "LDOS_postprocess_dipole_results.txt")
@@ -1268,19 +1794,32 @@ if __name__ == "__main__":
                     fp.write(f"method incoherent_ldos_dipole_sampling\n")
                     fp.write(f"n_dipoles {len(records)}\n")
                     fp.write(f"n_successful {sum(1 for r in records if 'spectrum' in r and r['spectrum'] is not None)}\n")
+                    fp.write(f"zero_angle_power {zero_angle_power:.16e}\n")
                     fp.write("angle_resolved_emission\n")
-                    fp.write("theta_deg emission_power normalized_power target_efficiency\n")
-                    for angle, power, normalized, eff in zip(angles_deg, angle_powers, angle_powers_normalized, target_efficiency_at_angles):
-                        fp.write(f"{angle:.2f} {power:.6e} {normalized:.6e} {eff:.6f}\n")
+                    fp.write("theta_deg emission_power normalized_power ratio_to_zero target_ratio\n")
+                    for angle, power, normalized, ratio, target_ratio in zip(
+                        angles_deg,
+                        angle_powers,
+                        angle_powers_normalized,
+                        angle_ratios_to_zero,
+                        target_ratio_at_angles,
+                    ):
+                        fp.write(
+                            f"{angle:.2f} {power:.6e} {normalized:.6e} "
+                            f"{ratio:.6e} {target_ratio:.6e}\n"
+                        )
                 print(f"[postprocess] saved dipole results: {results_path}")
 
                 # Save records
                 records_path = os.path.join(design_dir, "LDOS_postprocess_dipole_records.txt")
                 with open(records_path, "w", encoding="utf-8") as fp:
-                    fp.write("dipole_idx x_um y_um z_um total_power\n")
+                    fp.write("dipole_idx x_um y_um z_um theta_deg phi_deg total_power\n")
                     for rec in records:
                         if "spectrum" in rec and rec["spectrum"] is not None:
-                            fp.write(f"{rec['dipole_idx']} {rec['x']:.6e} {rec['y']:.6e} {rec['z']:.6e} {rec['total_power']:.6e}\n")
+                            fp.write(
+                                f"{rec['dipole_idx']} {rec['x']:.6e} {rec['y']:.6e} {rec['z']:.6e} "
+                                f"{rec['theta_deg']:.6e} {rec['phi_deg']:.6e} {rec['total_power']:.6e}\n"
+                            )
                 print(f"[postprocess] saved dipole records: {records_path}")
 
                 # Plot angle-resolved efficiency
@@ -1296,17 +1835,17 @@ if __name__ == "__main__":
                 axes[0].grid(True, alpha=0.3)
                 axes[0].legend()
 
-                # Right: Efficiency comparison
-                axes[1].plot(angles_deg, target_efficiency_at_angles, "r-", linewidth=2, label="Target efficiency")
-                axes[1].plot(angles_deg, angle_powers_normalized, "b-", linewidth=2, label="Achieved emission")
-                axes[1].fill_between(angles_deg, 0, target_efficiency_at_angles, alpha=0.2, color="red")
-                axes[1].fill_between(angles_deg, 0, angle_powers_normalized, alpha=0.2, color="blue")
+                # Right: ratio-to-zero comparison
+                axes[1].plot(angles_deg, target_ratio_at_angles, "r-", linewidth=2, label="Target ratio")
+                axes[1].plot(angles_deg, angle_ratios_to_zero, "b-", linewidth=2, label="Achieved ratio")
+                axes[1].fill_between(angles_deg, 0, target_ratio_at_angles, alpha=0.2, color="red")
+                axes[1].fill_between(angles_deg, 0, angle_ratios_to_zero, alpha=0.2, color="blue")
                 axes[1].set_xlabel("Angle (degrees)")
-                axes[1].set_ylabel("Efficiency / Normalized power")
-                axes[1].set_title("Target vs. Achieved Emission Efficiency")
+                axes[1].set_ylabel("Power ratio to 0 deg")
+                axes[1].set_title("Target vs. Achieved Angular Ratio")
                 axes[1].grid(True, alpha=0.3)
                 axes[1].legend()
-                axes[1].set_ylim([0, 1.1])
+                axes[1].set_ylim([0, max(1.1, float(np.nanmax(angle_ratios_to_zero)) * 1.05)])
 
                 plot_path = os.path.join(design_dir, "LDOS_postprocess_emission_efficiency.png")
                 fig.tight_layout()
