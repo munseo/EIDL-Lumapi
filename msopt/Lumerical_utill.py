@@ -1374,6 +1374,7 @@ class LumericalOptimizationProblem:
         adj_fwd=False,
         opt_idx=0,
         broadband_adjoint=False,
+        Incoherent=False,
     ):
         self.sim = sim
         self.objective_functions = objective_functions
@@ -1381,6 +1382,23 @@ class LumericalOptimizationProblem:
         self.forward_adj=adj_fwd
         self.opt_idx=opt_idx
         self.broadband_adjoint = broadband_adjoint
+        # INCOHERENT MODE
+        # Default (False) keeps the historical behaviour: every objective's
+        # dJ/dE is summed into ONE adjoint source and one adjoint run produces
+        # one gradient. That is correct only when the objectives are meant to be
+        # added coherently.
+        #
+        # With Incoherent=True each objective gets its OWN adjoint source and its
+        # OWN adjoint run, and the per-objective gradients are summed afterwards:
+        #     g = sum_j ( fwd x adj_j )
+        # The forward is still run once. Wavelength stays a SUB-level of the
+        # objective, so a multi-J multi-wavelength problem is executed in the
+        # order J1_lam1, J1_lam2, ..., JN_lam1, ... -- the existing broadband
+        # machinery is reused unchanged inside each objective.
+        self.Incoherent = bool(Incoherent)
+        self.adjoint_fields_per_J = []
+        self.f0_per_J = []
+        self.gradient_per_J = []
 
         self.H_field = any(arg >= 3 for arg in self.objective_arguments)
         self.num_components = 6 if self.H_field else 3
@@ -1971,8 +1989,78 @@ class LumericalOptimizationProblem:
             inserted_any = True
         self._adjoint_source_inserted = inserted_any
 
+    def _dJ_fields(self, J, args):
+        """dJ/dE (and dJ/dH) of ONE objective on the FoM plane -- the adjoint
+        source amplitude for that objective."""
+        ncomp = 6 if self.H_field else 3
+        Fields = [np.zeros_like(self.FoM_fields[c], dtype=np.complex128)
+                  for c in range(ncomp)]
+        for local_i, field_comp in enumerate(self.objective_arguments):
+            dJ = np.array(jacobian(J, argnum=local_i)(*args), dtype=np.complex128)
+            Fields[field_comp] += dJ
+        return Fields
+
+    def _run_adjoint_for_fields(self, Fields):
+        """Insert the adjoint source for one dJ/dE set, run it, return the
+        adjoint fields. Wavelength handling is untouched: broadband_adjoint
+        still decides between one multi-wavelength source and the per-wavelength
+        loop, so wavelength remains a sub-level of the objective."""
+        self.update_adjoint_dipole(Fields)
+        self.sim.fdtd.switchtolayout()
+        self.sim.fdtd.setnamed('FoM_monitor', 'enabled', False)
+        adjoint_fields = np.zeros_like(self.forward_fields, dtype=np.complex128)
+        if not getattr(self, "_adjoint_source_inserted", False):
+            self.sim.fdtd.setnamed('design_monitor', 'enabled', False)
+            print("[adjoint_dipole_run] zero adjoint source; using zero adjoint fields.")
+            return adjoint_fields
+        self.sim.fdtd.setnamed('design_monitor', 'enabled', True)
+        if self.broadband_adjoint and len(self.adj_wl) > 1:
+            adjoint_fields = self._run_adjoint_with_result_retry(source_name="adjoint_source")
+            self.sim.fdtd.switchtolayout()
+            self.sim.fdtd.eval('select("adjoint_source"); delete;')
+        else:
+            for iidx in range(len(self.adj_wl)):
+                res = self._run_adjoint_with_result_retry(source_name=f"adjoint_source_{iidx}")
+                adjoint_fields[:, :, :, :, iidx] = res[:, :, :, :, iidx]
+                self.sim.fdtd.switchtolayout()
+                self.sim.fdtd.eval(f'select("adjoint_source_{iidx}"); delete;')
+        self.sim.fdtd.switchtolayout()
+        self.sim.fdtd.setnamed('design_monitor', 'enabled', False)
+        self.sim.fdtd.setnamed('FoM_monitor', 'enabled', False)
+        return adjoint_fields
+
+    def adjoint_dipole_run_incoherent(self):
+        """One adjoint run PER objective, in the order J1_lam*, J2_lam*, ...
+
+        Each objective's adjoint fields are kept separately so calculate_gradient
+        can form fwd x adj_j for each and only then add them up. The forward run
+        is NOT repeated -- self.forward_fields and self.FoM_fields from the single
+        forward are reused for every objective.
+        """
+        start = time.time()
+        self.sim.fdtd.switchtolayout()
+        args = [self.FoM_fields[k] for k in self.objective_arguments]
+        nJ, nlam = len(self.objective_functions), max(len(self.sim.src_wl), 1)
+        print(f"[incoherent] {nJ} objective(s) x {nlam} wavelength(s); "
+              f"order J1_lam1..J1_lam{nlam}, ..., J{nJ}_lam{nlam}")
+        self.adjoint_fields_per_J = []
+        self.f0_per_J = [float(np.real(np.sum(J(*args)))) for J in self.objective_functions]
+        for jobj, J in enumerate(self.objective_functions):
+            t0 = time.time()
+            Fields = self._dJ_fields(J, args)
+            self.adjoint_fields_per_J.append(self._run_adjoint_for_fields(Fields))
+            print(f"[incoherent] J{jobj + 1}: f0={self.f0_per_J[jobj]:.6e}, "
+                  f"adjoint {time.time() - t0:.2f} s")
+        # keep the summed field so anything downstream that still reads
+        # self.adjoint_fields sees the coherent-equivalent result
+        self.adjoint_fields = np.sum(np.asarray(self.adjoint_fields_per_J), axis=0)
+        self.current_state = "Adj"
+        print(f"[incoherent] total adjoint time: {time.time() - start:.2f} s")
+
     """ Adjoint run"""
     def adjoint_dipole_run(self):
+        if getattr(self, "Incoherent", False):
+            return self.adjoint_dipole_run_incoherent()
         start = time.time()
         self.sim.fdtd.switchtolayout()
         args = [self.FoM_fields[k] for k in self.objective_arguments]
@@ -2036,7 +2124,32 @@ class LumericalOptimizationProblem:
 
 
     """Gradient calculation"""
-    def calculate_gradient(self, debug_mode: bool =False):
+    def calculate_gradient(self, debug_mode: bool = False):
+        # Incoherent: form fwd x adj_j for EVERY objective and only then sum.
+        # Going through the same code path per objective (rather than adding the
+        # adjoint fields first) is what makes the decomposition meaningful: the
+        # per-objective gradients are kept in self.gradient_per_J so the caller
+        # can see which objective is driving the design.
+        if getattr(self, "Incoherent", False) and self.adjoint_fields_per_J:
+            saved = self.adjoint_fields
+            self.gradient_per_J, total = [], None
+            try:
+                for jobj, adj_j in enumerate(self.adjoint_fields_per_J):
+                    self.adjoint_fields = adj_j
+                    g_j = np.asarray(self._calculate_gradient_single(debug_mode), dtype=float)
+                    self.gradient_per_J.append(g_j)
+                    total = g_j.copy() if total is None else total + g_j
+                    print(f"[incoherent] J{jobj + 1} |grad|={np.linalg.norm(g_j):.6e}")
+            finally:
+                self.adjoint_fields = saved
+            self.gradient = np.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+            print(f"[incoherent] summed |grad|={np.linalg.norm(self.gradient):.6e} "
+                  f"over {len(self.gradient_per_J)} objective(s)")
+            self.current_state = "INIT"
+            return self.gradient.flatten()
+        return self._calculate_gradient_single(debug_mode)
+
+    def _calculate_gradient_single(self, debug_mode: bool =False):
         fwd = np.asarray(self.forward_fields, dtype=np.complex128)   # (3, Nx, Ny, Nz, Nf) raw node/corner
         adj = np.asarray(self.adjoint_fields, dtype=np.complex128)   # (3, Nx, Ny, Nz, Nf) raw node/corner
         bad_fwd = np.count_nonzero(~np.isfinite(fwd))
@@ -2112,9 +2225,12 @@ class LumericalOptimizationProblem:
         if debug_mode:
             self.gradient = dJ_dus#.fletten()
         else:
-            if len(self.objective_functions) > 1:
+            if len(self.objective_functions) > 1 and not getattr(self, "Incoherent", False):
+                # coherent multi-objective: msopt's historical Minimax combination
                 self.gradient = Opt_MS2.Minimax(self.f0, dJ_dus)
             else:
+                # incoherent: this call handles ONE objective, so the only sum left
+                # is over frequency. The objective sum happens in calculate_gradient.
                 self.gradient = np.sum(dJ_dus, axis=0).flatten()
         self.gradient = np.nan_to_num(self.gradient, nan=0.0, posinf=0.0, neginf=0.0)
         print("[gradient_check] grad_3d_by_f.shape =", self.gradient.shape)

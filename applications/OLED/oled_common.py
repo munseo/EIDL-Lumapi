@@ -2665,6 +2665,52 @@ def cone_shares(theta2d, ukx, uky, spectrum, cones=(5.0, 10.0, 20.0, 30.0)):
     return [(float(c), float(np.sum(sp[th <= c])) / total) for c in cones]
 
 
+def pp_case_path(cache_dir, pol, idx):
+    return os.path.join(cache_dir, f"case_{pol}_{int(idx):03d}.npz")
+
+
+def save_pp_case(cache_dir, pol, idx, key, theta, spectrum, ukx, uky, T, src, dip, box):
+    """Persist one finished postprocess case so a re-run need not repeat it."""
+    if not cache_dir:
+        return
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        # np.savez_compressed appends .npz unless the name already ends in it, so the
+        # temp name has to carry the suffix or os.replace below chases a missing file.
+        tmp = pp_case_path(cache_dir, pol, idx) + ".tmp.npz"
+        np.savez_compressed(
+            tmp, key=np.array(key), theta=theta, spectrum=spectrum, ukx=ukx, uky=uky,
+            T=float(T),
+            src=np.nan if src is None else float(src),
+            dip=np.nan if dip is None else float(dip),
+            box=np.nan if box is None else float(box),
+        )
+        os.replace(tmp, pp_case_path(cache_dir, pol, idx))   # atomic: no half files
+    except Exception as exc:
+        print(f"[postprocess] cache write failed for pol={pol} dipole {idx}: {exc}")
+
+
+def load_pp_case(cache_dir, pol, idx, key):
+    """Return a cached case, or None. `key` pins the cache to the design and the
+    angular settings it was produced with, so a different design silently reusing
+    someone else's spectra is impossible."""
+    if not cache_dir:
+        return None
+    f = pp_case_path(cache_dir, pol, idx)
+    if not os.path.isfile(f):
+        return None
+    try:
+        with np.load(f, allow_pickle=False) as d:
+            if str(d["key"]) != str(key):
+                return None
+            unpack = lambda v: (None if not np.isfinite(v) else float(v))
+            return (d["theta"], d["spectrum"], d["ukx"], d["uky"], float(d["T"]),
+                    unpack(d["src"]), unpack(d["dip"]), unpack(d["box"]))
+    except Exception as exc:
+        print(f"[postprocess] cache read failed for {f}: {exc}")
+        return None
+
+
 def run_postprocess(G, final_design, mapping=None, performance_spec=None):
     pp_t0 = time.time()
     # MSOPT_OLED_PP_PLANAR discards the design and characterizes an UNPATTERNED
@@ -2685,6 +2731,10 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
         mapping = None
         which = "high index (flat slab of design material)" if fill else "low index (bare stack, nothing on top)"
         print(f"[postprocess] PLANAR BASELINE: design discarded, design region = {which}")
+    # Case cache. Defaults to this run's own folder; MSOPT_OLED_PP_CACHE_DIR can point
+    # at a previous run's cache to finish a postprocess that died part-way.
+    pp_cache_dir = os.environ.get(
+        "MSOPT_OLED_PP_CACHE_DIR", os.path.join(G.design_dir, "pp_cache")).strip()
     rho = design_to_grid(G, final_design, mapping)
     if np.asarray(G.visible_wavelengths).size != 1:
         raise ValueError(
@@ -2911,6 +2961,15 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
         raise ValueError(
             "MSOPT_OLED_PP_ANGULAR_PROJECTION must be 'farfield3d' or 'monitor_fft'."
         )
+
+    # Cache identity: the design, plus everything that changes what a single case
+    # computes. A cached spectrum is reused only when all of it matches, so a
+    # different design can never quietly inherit another one's cases.
+    pp_cache_key = "|".join(str(v) for v in (
+        hashlib.sha256(np.ascontiguousarray(rho, dtype=float).tobytes()).hexdigest()[:16],
+        G.resolution, angular_projection, float(np.mean(G.visible_wavelengths)),
+        G.target_monitor_c[2], G.Sx, G.Sy, G.Sz,
+    ))
     manifest_path = os.path.join(G.design_dir, "OLED_postprocess_manifest.json")
     design_hash = hashlib.sha256(np.ascontiguousarray(rho, dtype=np.float64).tobytes()).hexdigest()
     manifest = {
@@ -3037,36 +3096,47 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
         for i, (x, y, z, _p) in enumerate(post_sources):
             print(f"[postprocess] {tile_n}x{tile_n}/PML pol={pol} dipole {i + 1}/{len(post_sources)}: x={x:.3f}, y={y:.3f}")
             case_succeeded = False
+            # One flaky case at the end used to discard every other case's ANGULAR
+            # SPECTRUM, because the spectra only ever lived in memory -- 71 good runs
+            # thrown away for one failure. Each finished case is now written next to
+            # the run, so a re-run repeats only what is actually missing.
+            cached = load_pp_case(pp_cache_dir, pol, i, pp_cache_key)
             last_error = None
             for attempt in range(pp_retries + 1):
-                try:
-                    sim.fdtd.switchtolayout()
-                    delete_object(sim.fdtd, "postprocess_dipole")
-                    add_dipole(G, sim, x, y, z + z_shift, pol, "postprocess_dipole")
-                    if pp_field_images:
-                        sim.fdtd.setnamed(pp_xz_monitor_name, "y", y * 1e-6)
-                    sim.run(name=f"postprocess_pml_{run_idx:03d}", save=True)
-                    load_run_results(sim)
-                    T = read_transmission(sim.fdtd, G.target_monitor_name)
-                    if angular_projection == "farfield3d":
-                        theta_i, spectrum_i, ukx_i, uky_i = n2f_spectrum(sim, G.target_monitor_name)
-                    else:
-                        theta_i, spectrum_i, ukx_i, uky_i = monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T >= 0 else -1.0)
-                    freqs = source_freqs(G, sim)
-                    src_power = read_source_power(sim.fdtd, freqs)
-                    dip_power = read_dipole_power(sim.fdtd, freqs)
-                    box_power = (
-                        read_flux_box_power(sim.fdtd, source_flux_box_faces, src_power)
-                        if source_flux_box_faces
-                        else None
-                    )
-                except Exception as exc:
-                    last_error = str(exc)
-                    if attempt < pp_retries:
-                        print(f"[postprocess] warning: pol={pol} dipole {i} attempt {attempt + 1} failed ({exc}); re-running")
-                        continue
-                    print(f"[postprocess] warning: pol={pol} dipole {i} failed after {pp_retries + 1} attempts: {exc}")
-                    break
+                if cached is not None:
+                    (theta_i, spectrum_i, ukx_i, uky_i,
+                     T, src_power, dip_power, box_power) = cached
+                    if attempt == 0:
+                        print(f"[postprocess] cache hit pol={pol} dipole {i} -- FDTD skipped")
+                else:
+                    try:
+                        sim.fdtd.switchtolayout()
+                        delete_object(sim.fdtd, "postprocess_dipole")
+                        add_dipole(G, sim, x, y, z + z_shift, pol, "postprocess_dipole")
+                        if pp_field_images:
+                            sim.fdtd.setnamed(pp_xz_monitor_name, "y", y * 1e-6)
+                        sim.run(name=f"postprocess_pml_{run_idx:03d}", save=True)
+                        load_run_results(sim)
+                        T = read_transmission(sim.fdtd, G.target_monitor_name)
+                        if angular_projection == "farfield3d":
+                            theta_i, spectrum_i, ukx_i, uky_i = n2f_spectrum(sim, G.target_monitor_name)
+                        else:
+                            theta_i, spectrum_i, ukx_i, uky_i = monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T >= 0 else -1.0)
+                        freqs = source_freqs(G, sim)
+                        src_power = read_source_power(sim.fdtd, freqs)
+                        dip_power = read_dipole_power(sim.fdtd, freqs)
+                        box_power = (
+                            read_flux_box_power(sim.fdtd, source_flux_box_faces, src_power)
+                            if source_flux_box_faces
+                            else None
+                        )
+                    except Exception as exc:
+                        last_error = str(exc)
+                        if attempt < pp_retries:
+                            print(f"[postprocess] warning: pol={pol} dipole {i} attempt {attempt + 1} failed ({exc}); re-running")
+                            continue
+                        print(f"[postprocess] warning: pol={pol} dipole {i} failed after {pp_retries + 1} attempts: {exc}")
+                        break
                 # ---- all session reads done; commit (no fdtd calls below) ----
                 # Full LEE = extracted top power / validated source-box emission.
                 # is normalized to source power, so absolute top power = |T|*source_power;
@@ -3136,6 +3206,10 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
                     total_emitted, top_power_abs, lee, dipole_box_rel_diff,
                 ))
                 case_succeeded = True
+                if cached is None:
+                    save_pp_case(pp_cache_dir, pol, i, pp_cache_key,
+                                 theta_i, spectrum_i, ukx_i, uky_i,
+                                 T, src_power, dip_power, box_power)
                 # Per-dipole angular breakdown: ring flux split into absolute extraction
                 # efficiency per angle bin (sums to this dipole's LEE), plus the
                 # per-direction radiance (solid-angle Jacobian removed) for the shape.

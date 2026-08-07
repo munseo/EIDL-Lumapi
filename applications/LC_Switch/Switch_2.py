@@ -456,7 +456,7 @@ for seq in [0]:
     # 4 deg gave d 0.575 -> 0.8 -> 1.1 um moving R 0.818 -> 0.917 -> 0.959 while T
     # fell 0.776 -> 0.668 -> 0.561. Thinner loses R faster than it gains T.
     wall_thickness = 0.575
-    lc_clearance = 0.0
+    lc_clearance = 0.3
     lc_wall_rotation_deg = 0.0
     lc_wall_length = np.sqrt(2.0) * max(design_region_y, design_region_z)
 

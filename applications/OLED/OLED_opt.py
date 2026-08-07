@@ -112,15 +112,30 @@ MC_STACK_KIND = "optimized"
 # 51 x 16 = 816 parameters instead of the full 101 x 101 x 16 = 163,216 -- and it
 # is what makes a SINGLE reciprocal pole sufficient, because a y dipole is then
 # the x one rotated by 90 deg. Turn it OFF to resume a full-freeform run.
-RADIAL_DESIGN = False
+RADIAL_DESIGN = True
 
 # Warm start. RESUME_FROM points at a previous run's Local_bests/, RESUME_ITER at
 # the saved iteration; param_<it>.txt (beta, LR) and ref_layer_<it>.txt (the design
 # vector) are copied in and handed to OPT_Ms(Load=True). The design vector length
 # must match this run's parameter count, so the geometry AND RADIAL_DESIGN have to
 # be the same as the run being resumed -- the code checks and refuses otherwise.
-RESUME_FROM = "/home/eidl/Lumerical_data/Failed/20260804_035941_OLED_opt_gpu5_th30/Local_bests"
-RESUME_ITER = 237
+# Fresh start. The 237-iteration checkpoint below belongs to a FULL-FREEFORM run
+# (163,216 parameters); it cannot seed a radial run (816), so resuming is only
+# possible with RADIAL_DESIGN = False.
+# RESUME_FROM = "/home/eidl/Lumerical_data/Failed/20260804_035941_OLED_opt_gpu5_th30/Local_bests"
+RESUME_FROM = ""
+RESUME_ITER = 0
+
+# Pick up automatically where the last compatible run left off.
+#
+# The FDTD engine asks the licence server for 9 tasks NO MATTER what -th is set to
+# (verified: th3, th4 and th8 all request 9), so when the pool is saturated a run
+# dies wherever it happens to be and no launcher tuning prevents it. What CAN be
+# fixed is losing the work: on startup, scan previous runs of this script for the
+# newest Local_bests checkpoint whose design vector matches this configuration's
+# parameter count, and resume from it. Explicit RESUME_FROM always wins.
+AUTO_RESUME = True
+AUTO_RESUME_ROOT = "/home/eidl/Lumerical_data"
 
 oc.export_run_knobs(
     run_optimization=RUN_OPTIMIZATION, planar_pp=PLANAR_PP, pp_mode=PP_MODE,
@@ -661,6 +676,52 @@ x0 = G.grating_initial_density * np.ones(design_parameters)
 dJ_0 = np.zeros(G.design_cells)
 
 
+def find_latest_checkpoint(n_params):
+    """Newest Local_bests checkpoint from a previous run of this script whose design
+    vector length matches n_params.
+
+    Length is the compatibility test that matters: a radial run stores 816 values and
+    a full-freeform one 163,216, and feeding the wrong one to OPT_Ms fails deep inside
+    the mapping. Runs are searched newest-first and the first size-compatible one wins;
+    incompatible ones are reported so a silent mismatch cannot look like "no checkpoint".
+    """
+    pats = [os.path.join(AUTO_RESUME_ROOT, d, "*OLED_opt*", "Local_bests")
+            for d in ("Ongoing", "Done", "Failed")]
+    cands = []
+    for pat in pats:
+        cands.extend(glob.glob(pat))
+    # exclude this run's own (empty) directory
+    cands = [c for c in cands if os.path.abspath(c) != os.path.abspath(G.local_dir)]
+    cands.sort(key=lambda c: os.path.getmtime(c), reverse=True)
+    skipped = []
+    for c in cands:
+        refs = glob.glob(os.path.join(c, "ref_layer_*.txt"))
+        if not refs:
+            continue
+        best_it, best_f = -1, None
+        for f in refs:
+            try:
+                it = int(os.path.basename(f).split("_")[-1][:-4])
+            except ValueError:
+                continue
+            if it > best_it and os.path.isfile(os.path.join(c, f"param_{it}.txt")):
+                best_it, best_f = it, f
+        if best_f is None:
+            continue
+        try:
+            n = np.loadtxt(best_f).size
+        except Exception:
+            continue
+        if n == n_params:
+            print(f"[auto-resume] {c} iteration {best_it} ({n:,} design values)")
+            return c, best_it
+        skipped.append((os.path.basename(os.path.dirname(c)), best_it, n))
+    for name, it, n in skipped[:3]:
+        print(f"[auto-resume] skipped {name} iter {it}: {n:,} values != {n_params:,}")
+    print(f"[auto-resume] no compatible checkpoint for {n_params:,} parameters; starting fresh")
+    return "", 0
+
+
 def make_adjoint_loop(opt, sims=None):
     def Adjoint_loop(X, N_cases, Case=True):
         if Case == 3:
@@ -863,6 +924,10 @@ if __name__ == "__main__":
         # param_N.txt / ref_layer_N.txt, so the pair has to be copied in first.
         resume_iter = 0
         resume_src = os.environ.get("MSOPT_OLED_RESUME_FROM", RESUME_FROM or "").strip()
+        if not resume_src and AUTO_RESUME:
+            resume_src, resume_auto_iter = find_latest_checkpoint(design_parameters)
+            if resume_src:
+                os.environ.setdefault("MSOPT_OLED_RESUME_ITER", str(resume_auto_iter))
         if resume_src:
             resume_iter = int(oc.env_float("MSOPT_OLED_RESUME_ITER", RESUME_ITER or 0))
             src_par = os.path.join(resume_src, f"param_{resume_iter}.txt")
