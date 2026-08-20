@@ -195,13 +195,23 @@ class OPT_Ms:
         Born_k=50,
         Initial_LR=0.2,
         Raw: bool = False,
+        Initial_beta=1.0,
     ):
         self.Array=[0]*5 #--------------|
         self.Array[0]= Initial_geo      # 0: Geometry
         self.Array[1]= Initial_geo*0    # 1: Jacobian gradient 
         self.Array[2]= Initial_grad     # 2: 1st order momentum gradient  
         self.Array[3]= Initial_grad     # 3: 2nd order momentum gradient
-        self.Array[4]= 1.0              # 4: Beta for mapping function
+        # 4: Beta for the tanh projection. 1.0 is the historical start and stays
+        # the default. Raising it matters for a FILTERLESS (freeform) design:
+        # with an MFS filter the run spends its first ~76 evaluations blurred and
+        # then jumps when projection sharpens (measured: match 0.2 -> 0.5 in 3
+        # evaluations, ending at 0.86), whereas freeform has no such mechanism and
+        # crawls from 0.2 to 0.5 over ~90 evaluations, topping out at 0.55.
+        # Starting beta high gives freeform that snap. Safe here only because
+        # seeded_x0 is BAND-LIMITED: projection binarizes whatever is present, so
+        # a white-noise seed would freeze in pixel grass instead of a grating.
+        self.Array[4]= float(Initial_beta)
         #
         self.Parameters=[0]*5 #---------|
         self.Parameters[0]=Initial_LR   # 0: Learning rate
@@ -303,9 +313,9 @@ class OPT_Ms:
             self.Parameters[3] +=1         # warm restart count
             if self.Parameters[3] == 3:    # warm restarter tol : 3 -> save local best info.
                 if self.Parameters[0] > 0.0001:
-                    self.Parameters[0] *= 5
+                    self.Parameters[0] *= 50
                 else:
-                    self.Parameters[0] *= 20
+                    self.Parameters[0] *= 1000
                 self.Parameters[3]= 0
                 print('\n Warm restart with LR: 0.2 \n')
         else:
@@ -852,7 +862,11 @@ class Mapping:
         self.N_radius = None
         self.radial_3d_vertical_grating = False
         self.slanted= Is_slanted_grating
-        self.N_height=DR_N_info[DR_info[5]]
+        self.DR_width = DR_info[DR_info[3]]
+        self.N_width = DR_N_info[DR_info[3]]
+        self.DR_length = DR_info[DR_info[4]]
+        self.N_length = DR_N_info[DR_info[4]]
+        self.N_height = DR_N_info[DR_info[5]]
         self.need_T = True
         if isinstance(Is_radial_3d, dict):
             self.radial_3d_enabled = bool(Is_radial_3d.get("enabled", False))
@@ -999,6 +1013,21 @@ class Mapping:
                         x_copy = npa.reshape(x_copy,(self.N_height,self.N_width*self.N_length)).transpose()
                     return Sub_Mapping.tanh_projection_m(x_copy, beta, 0.5).flatten()
                 else:
+                    if self.Sym_geo_C8:
+                        x_copy = npa.reshape(x,(self.N_width*self.N_length,self.N_height))
+                        x2 = []
+                        h_temp=0
+                        while h_temp < self.N_height:
+                            x_ref= x_copy[:,h_temp]
+                            x_ref = npa.reshape(x_ref,(self.N_width,self.N_length))
+                            x_ref = (npa.fliplr(x_ref) + x_ref)/2
+                            x_ref = (npa.flipud(x_ref) + x_ref)/2
+                            x_ref = (x_ref.transpose() + x_ref)/2
+                            x_ref = x_ref.flatten() 
+                            x2 = npa.concatenate((x_ref,x2), axis=0)
+                            h_temp+=1
+                        x2= x2.flatten()
+                        x = npa.reshape(x2,(self.N_height,self.N_width*self.N_length)).transpose()
                     xx=Sub_Mapping.tanh_projection_m(x, beta, eee)
                     return Sub_Mapping.tanh_projection_m(xx, beta, 0.5).flatten()
             else:

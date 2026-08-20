@@ -56,17 +56,33 @@ Section -> source map:
                                   save_fom_monitor_field_snapshot,
                                   save_optimization_emission_plot)
   * postprocess ................. OLED_new.py base, upgraded to the validated
-                                  step1/step2 protocol: 6x6 endpoint sources,
-                                  source-wise incoherent sum, EML flux-box
-                                  normalization, farfield3d solid-angle
-                                  integration, and optional case2a/2b/3
-                                  coherence audit. Supercell is the default;
-                                  single/n2f is qualitative only.
+                                  step1/step2 protocol: source-wise incoherent
+                                  sum, EML flux-box normalization, farfield3d
+                                  solid-angle integration, and optional
+                                  case2a/2b/3 coherence audit. Supercell is the
+                                  default; single/n2f is qualitative only.
+                                  The dipole layout has since moved on from the
+                                  reference's 6x6 endpoint grid: a mirror-
+                                  symmetric design is sampled on a 12x12
+                                  cell_center grid folded onto its C4v orbits --
+                                  the same 36 FDTD runs, four times the
+                                  independent samples. See resolve_dipole_grid;
+                                  MSOPT_OLED_PP_DIPOLE_GRID and
+                                  MSOPT_OLED_PP_SOURCE_LAYOUT still select the
+                                  reference protocol explicitly.
   * optimizer harness ........... OLED_new.py main(): the result0..result6
                                   optimizer-history figures
                                   (save_result_plots) and the
                                   MSOPT_OLED_SESSION_TEST early-exit banner
                                   (session_test_banner)
+
+    NOTE (2026-08-19): the inventory above is the provenance of everything this
+    module ever absorbed, and is kept as such. The application has since been
+    reduced to the OLED_rec chain, and the 28 functions only the retired scripts
+    used now live in legacy/oled_common_legacy.py -- so some names listed above
+    are no longer defined here. The split was computed as a reachability closure
+    from every `oc.NAME` the live files reference; oled_constrained_score stayed
+    because test_oled_common still exercises it.
 
 Design pattern: every function that read module globals in the originals now
 takes the config namespace `G` (from build_config) as its first argument;
@@ -106,6 +122,12 @@ def env_flag(name, default="0"):
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_str(name, default):
+    """Trimmed string override; an empty/whitespace value falls back to default
+    so `VAR= python ...` behaves like "not set" rather than selecting ""."""
+    return (os.environ.get(name, "") or "").strip() or str(default)
+
+
 def env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
@@ -120,18 +142,8 @@ def env_list_float(name, default):
     return [float(v) for v in vals] if vals else list(default)
 
 
-def env_list_str(name, default):
-    raw = os.environ.get(name, "").replace(";", ",").replace(" ", ",")
-    vals = [v.strip().lower() for v in raw.split(",") if v.strip()]
-    return vals if vals else list(default)
 
 
-def broadcast(values, size, name):
-    if len(values) == size:
-        return list(values)
-    if len(values) == 1:
-        return list(values) * size
-    raise ValueError(f"{name} must have length 1 or {size}, got {len(values)}")
 
 
 # =============================================================================
@@ -600,11 +612,6 @@ def dipole_angles(pol):
     raise ValueError(f"Unsupported dipole polarization {pol!r}.")
 
 
-def set_fdtd_background_index(fdtd, index_value):
-    try:
-        fdtd.setnamed("FDTD", "index", float(index_value))
-    except Exception:
-        fdtd.eval(f'select("FDTD"); set("index", {float(index_value):.16g});')
 
 
 def delete_object(fdtd, name):
@@ -828,17 +835,6 @@ def valid_power(value):
     return value if np.isfinite(value) and value > 0.0 else None
 
 
-def choose_norm_power(G, incident_power, bulk_power, source_power, current_power):
-    for label, value in (
-        ("design_incident_power", incident_power),
-        ("bulk_reference_power", bulk_power),
-        ("source_power", source_power),
-        ("current_dipole_power", current_power),
-    ):
-        value = valid_power(value)
-        if value is not None:
-            return max(value, G.channel_power_floor), label
-    return G.channel_power_floor, "floor"
 
 
 # =============================================================================
@@ -890,66 +886,12 @@ def build_target_orders(G, wavelength_um=None, period_x_um=None, period_y_um=Non
     return {"orders": orders, "wavelength_um": wavelength_um, "period_x_um": period_x_um, "period_y_um": period_y_um}
 
 
-def save_target_orders(G, info):
-    path = os.path.join(G.design_dir, "OLED_target_orders.csv")
-    with open(path, "w", encoding="utf-8") as fp:
-        fp.write("m,n,kx_over_k0,ky_over_k0,theta_deg,phi_deg,target_efficiency\n")
-        for o in info["orders"]:
-            fp.write(
-                f"{o['m']},{o['n']},{o['ux']:.8f},{o['uy']:.8f},"
-                f"{o['theta_deg']:.8f},{o['phi_deg']:.8f},{o['efficiency']:.8f}\n"
-            )
-    print(f"[target] saved {len(info['orders'])} propagating orders: {path}")
-    save_target_orders_figure(G, info)
 
 
-def save_target_orders_figure(G, info):
-    orders = info["orders"]
-    if not orders:
-        return
-    theta_max = max((o["theta_deg"] for o in orders), default=0.0)
-    angle_range = np.linspace(0.0, max(theta_max + 5.0, 1.0), 181)
-    eff_range = np.asarray([G.interp_curve(a) for a in angle_range], dtype=float)
-    signed_angles = np.concatenate((-angle_range[1:][::-1], angle_range))
-    signed_eff = np.concatenate((eff_range[1:][::-1], eff_range))
-
-    fig = plt.figure(figsize=(6.5, 3.9))
-    ax = fig.add_subplot(111, projection="polar")
-    ax.plot(np.deg2rad(signed_angles), signed_eff, "b-", linewidth=2, label="target efficiency")
-    for o in orders:
-        if o["efficiency"] <= 0.0:
-            continue
-        angle = o["theta_deg"]
-        order_angles = [0.0] if abs(angle) <= 1e-12 else [-angle, angle]
-        ax.scatter(np.deg2rad(order_angles), [o["efficiency"]] * len(order_angles), c="tab:orange", s=60, zorder=5)
-        ax.text(np.deg2rad(angle), min(float(o["efficiency"]) + 0.05, 1.0), f"({o['m']},{o['n']})", ha="center", va="bottom", fontsize=7)
-    ax.scatter([], [], c="tab:orange", s=60, label="propagating orders")
-    ax.set_thetamin(-90)
-    ax.set_thetamax(90)
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.set_rlim(0.0, 1.0)
-    ax.set_title(f"Angular target (lambda={info['wavelength_um']}um, period={info['period_x_um']}x{info['period_y_um']}um)")
-    ax.grid(True, alpha=0.35)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.18))
-    fig.tight_layout()
-    path = os.path.join(G.design_dir, "OLED_target_field_info.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"[target] saved target field info figure: {path}")
 
 
-def dft_matrix(n):
-    i = np.arange(int(n), dtype=float)
-    return np.exp(-2j * np.pi * np.outer(i, i) / float(n))
 
 
-def order_mask(ukx, uky, ux, uy, sigma_deg, propagating):
-    sigma = max(float(np.sin(np.deg2rad(max(float(sigma_deg), 1e-9)))), 1e-9)
-    w = np.exp(-0.5 * (((ukx - ux) ** 2 + (uky - uy) ** 2) ** 0.5 / sigma) ** 2)
-    w = np.where(propagating, w, 0.0)
-    peak = float(np.max(w))
-    return w / peak if peak > 0.0 else w
 
 
 def nearest_order_labels(ukx, uky, orders, propagating):
@@ -972,145 +914,16 @@ def nearest_order_labels(ukx, uky, orders, propagating):
 # =============================================================================
 
 
-def build_ramp_target(G, angle_thetas):
-    """Piecewise-linear target ratio CURVE over the available emission angles.
-
-    The specified (angle, ratio) pairs are control points; between them the target ratio
-    varies linearly, so the intermediate emission angles also follow the ratio (e.g.
-    0:1, 45:0.85 -> 1.0 at 0 deg ramping to 0.85 at the 45-deg mode). Energy is packed
-    into [min control angle, max control angle] with that shape; angles outside the range
-    are leakage (target 0). Control angles snap to the nearest available emission mode.
-    Returns (target_profile[sum=1 in-range], in_range, spec_idx, ctrl_a, ctrl_r).
-    """
-    ctrl = sorted(((float(a), float(r)) for a, r in G.target_angle_pairs), key=lambda ar: ar[0])
-    ctrl_a = np.asarray([float(angle_thetas[int(np.argmin(np.abs(angle_thetas - a)))]) for a, _ in ctrl], dtype=float)
-    ctrl_r = np.asarray([r for _, r in ctrl], dtype=float)
-    order = np.argsort(ctrl_a)
-    ctrl_a, ctrl_r = ctrl_a[order], ctrl_r[order]
-    a_lo, a_hi = float(ctrl_a[0]), float(ctrl_a[-1])
-    in_range = (angle_thetas >= a_lo - 1e-6) & (angle_thetas <= a_hi + 1e-6)
-    target_curve = np.where(in_range, np.interp(angle_thetas, ctrl_a, ctrl_r), 0.0)
-    target_profile = target_curve / max(float(np.sum(target_curve)), 1e-30)
-    spec_idx = [int(np.argmin(np.abs(angle_thetas - a))) for a in ctrl_a]
-    return target_profile, in_range.astype(float), spec_idx, ctrl_a, ctrl_r
 
 
-def _angular_target_1d(G, x, y, k0):
-    # phi = 0 radial line: 1D-DFT along x at y = 0. Emission angles are the (m,0) orders,
-    # sin(theta) = kx/k0 = m*lambda/P. +-kx of the same |theta| grouped into one mode.
-    dx = abs(float(np.mean(np.diff(x))))
-    iy0 = int(np.argmin(np.abs(y)))
-    kx = 2.0 * np.pi * np.fft.fftfreq(x.size, d=dx)
-    u = kx / k0
-    propagating = np.abs(u) <= 1.0 + 1e-9
-    theta = np.round(np.rad2deg(np.arcsin(np.clip(np.abs(u), 0.0, 1.0))), 3)
-    angle_thetas = np.asarray(sorted({float(t) for t, p in zip(theta, propagating) if p}), dtype=float)
-    if angle_thetas.size == 0:
-        angle_thetas = np.zeros(1, dtype=float)
-    angle_select = np.stack([((np.abs(theta - th) < 1e-3) & propagating).astype(float) for th in angle_thetas])
-    target_profile, in_range, spec_idx, ctrl_a, ctrl_r = build_ramp_target(G, angle_thetas)
-    print(f"[target] mode=radial_1d, phi=0 (m,0) angles {np.round(angle_thetas, 1).tolist()} deg; "
-          f"in-range {np.round(angle_thetas[in_range > 0.5], 1).tolist()}, target {np.round(target_profile, 3).tolist()}")
-    return {
-        "mode": "radial_1d",
-        "x_size": x.size, "y_size": y.size, "iy0": iy0,
-        "dft_x": dft_matrix(x.size),
-        "angle_select": angle_select,
-        "angle_thetas": angle_thetas, "in_range": in_range, "target_profile": target_profile,
-        "spec_idx": spec_idx, "spec_snapped": ctrl_a.tolist(), "ctrl_ratios": ctrl_r.tolist(),
-    }
 
 
-def _angular_target_2d(G, x, y, k0):
-    # Full 2D monitor: 2D-DFT to (kx,ky), then azimuthally integrate the flux over each
-    # polar-angle ring. Captures every (m,n) diffraction order, not just (m,0), so it is
-    # valid for the non-cylindrical / dual-polarization case.
-    dx, dy = abs(float(np.mean(np.diff(x)))), abs(float(np.mean(np.diff(y))))
-    kx = 2.0 * np.pi * np.fft.fftfreq(x.size, d=dx)
-    ky = 2.0 * np.pi * np.fft.fftfreq(y.size, d=dy)
-    KX, KY = np.meshgrid(kx, ky, indexing="ij")
-    u = np.sqrt(KX ** 2 + KY ** 2) / k0
-    propagating = u <= 1.0 + 1e-9
-    theta = np.round(np.rad2deg(np.arcsin(np.clip(u, 0.0, 1.0))), 3)
-    angle_thetas = np.asarray(sorted({float(t) for t, p in zip(theta.ravel(), propagating.ravel()) if p}), dtype=float)
-    if angle_thetas.size == 0:
-        angle_thetas = np.zeros(1, dtype=float)
-    # ring_select[k] gathers every (m,n) bin whose polar angle == angle_thetas[k]
-    # (azimuthal integration over all orders on that ring).
-    ring_select = np.stack([((np.abs(theta - th) < 1e-3) & propagating).astype(float) for th in angle_thetas])
-    target_profile, in_range, spec_idx, ctrl_a, ctrl_r = build_ramp_target(G, angle_thetas)
-    print(f"[target] mode=kspace_2d, (m,n) angles {np.round(angle_thetas, 1).tolist()} deg; "
-          f"in-range {np.round(angle_thetas[in_range > 0.5], 1).tolist()}, target {np.round(target_profile, 3).tolist()}")
-    return {
-        "mode": "kspace_2d",
-        "x_size": x.size, "y_size": y.size,
-        "dft_x": dft_matrix(x.size), "dft_y": dft_matrix(y.size),
-        "ring_select": ring_select,
-        "angle_thetas": angle_thetas, "in_range": in_range, "target_profile": target_profile,
-        "spec_idx": spec_idx, "spec_snapped": ctrl_a.tolist(), "ctrl_ratios": ctrl_r.tolist(),
-    }
 
 
-def angular_target_from_monitor_grid(G, x_axis, y_axis, target_info):
-    """Angle basis for the FoM. Dispatches on G.fom_mode (radial_1d / kspace_2d)."""
-    x = np.ravel(np.asarray(x_axis, dtype=float))
-    y = np.ravel(np.asarray(y_axis, dtype=float))
-    k0 = 2.0 * np.pi / (float(target_info["wavelength_um"]) * 1e-6)
-    builder = _angular_target_2d if G.fom_mode == "kspace_2d" else _angular_target_1d
-    return builder(G, x, y, k0)
 
 
-def _ramp_fom(G, profile, target):
-    """Shared T * M**ratio_emphasis overlap against the linear-ramp target profile."""
-    in_range = npa.asarray(target["in_range"])
-    tgt = npa.asarray(target["target_profile"])
-    throughput = npa.sum(profile * in_range)
-    q = profile / (throughput + 1e-30)
-    match = npa.sum(npa.minimum(q * in_range, tgt))
-    fom = throughput * (match ** G.ratio_emphasis)
-    fracs = [profile[int(k)] for k in target["spec_idx"]]
-    return fom, fracs, throughput, match
 
 
-def angular_powers(G, Ex, Ey, Hx, Hy, target, flux_sign=1.0):
-    """Emission-angle power profile -> ramp-overlap FoM. Dispatches on target['mode']."""
-    if target.get("mode") == "kspace_2d":
-        dft_x, dft_y = npa.asarray(target["dft_x"]), npa.asarray(target["dft_y"])
-
-        def spectrum2d(f):
-            if f.shape[0] != target["x_size"] or f.shape[1] != target["y_size"]:
-                raise ValueError(f"monitor shape {f.shape} does not match angular target")
-            # Two sequential 1D DFTs (O(N^3)); a single 3-operand einsum is O(N^4) under
-            # autograd (no path optimization) and was ~85x slower on a 126x126 monitor.
-            g = npa.einsum("ia,ab...->ib...", dft_x, f)    # DFT along x
-            return npa.einsum("jb,ib...->ij...", dft_y, g)  # DFT along y -> (kx,ky)
-
-        Ex_k, Ey_k, Hx_k, Hy_k = [spectrum2d(f) for f in (Ex, Ey, Hx, Hy)]
-        flux = 0.5 * float(flux_sign) * npa.real(Ex_k * npa.conj(Hy_k) - Ey_k * npa.conj(Hx_k))
-        if flux.ndim > 2:
-            flux = npa.sum(flux, axis=tuple(range(2, flux.ndim)))     # sum over wavelengths
-        flux = npa.maximum(npa.where(npa.isfinite(flux), flux, 0.0), 0.0)
-        # Azimuthal integration: sum Sz(kx,ky) over every (m,n) bin on each theta ring.
-        power = npa.einsum("kij,ij->k", npa.asarray(target["ring_select"]), flux)
-    else:
-        iy0 = int(target["iy0"])
-        dft = npa.asarray(target["dft_x"])
-
-        def line_spectrum(f):
-            if f.shape[0] != target["x_size"] or f.shape[1] != target["y_size"]:
-                raise ValueError(f"monitor shape {f.shape} does not match angular target")
-            return npa.einsum("ia,a...->i...", dft, f[:, iy0])         # phi=0 line -> kx
-
-        Ex_k, Ey_k, Hx_k, Hy_k = [line_spectrum(f) for f in (Ex, Ey, Hx, Hy)]
-        flux = 0.5 * float(flux_sign) * npa.real(Ex_k * npa.conj(Hy_k) - Ey_k * npa.conj(Hx_k))
-        if flux.ndim > 1:
-            flux = npa.sum(flux, axis=tuple(range(1, flux.ndim)))      # sum over wavelengths
-        flux = npa.maximum(npa.where(npa.isfinite(flux), flux, 0.0), 0.0)
-        power = npa.einsum("ki,i->k", npa.asarray(target["angle_select"]), flux)
-
-    profile = power / (npa.sum(power) + 1e-30)
-    fom, fracs, throughput, match = _ramp_fom(G, profile, target)
-    return npa.sum(power), fom, fracs, profile, throughput, match
 
 
 # =============================================================================
@@ -1118,48 +931,8 @@ def angular_powers(G, Ex, Ey, Hx, Hy, target, flux_sign=1.0):
 # =============================================================================
 
 
-def optimization_polarizations():
-    # Multi-objective route: "x,y" -> N_fom=2, each polarization is one coherent-grid
-    # objective and the optimizer optimizes their mean (see combine_fom). Default single.
-    raw = os.environ.get(
-        "MSOPT_OLED_OPT_POLARIZATIONS",
-        os.environ.get("MSOPT_OLED_OPT_DIPOLE_POLARIZATION", "x, y"),
-    )
-    pols = [p.strip().lower() for p in raw.replace(";", ",").replace(" ", ",").split(",") if p.strip()]
-    for p in pols:
-        if p not in ("x", "y", "z"):
-            raise ValueError(f"Unsupported optimization dipole polarization {p!r}.")
-    return pols or ["x"]
 
 
-def build_evenly_spaced_dipoles(G, pol="x"):
-    """A compact, uniformly spaced grid of same-polarization dipoles = one coherent
-    optimization objective (all fired together in a single sim)."""
-    count = max(1, env_int("MSOPT_OLED_OPT_DIPOLE_COUNT", 25))
-    grid_n = max(1, int(np.ceil(np.sqrt(count))))
-    xs = np.linspace(-G.active_radius, G.active_radius, grid_n)
-    ys = np.linspace(-G.active_radius, G.active_radius, grid_n)
-    pol = str(pol).strip().lower()
-    if pol not in {"x", "y", "z"}:
-        raise ValueError(f"Unsupported optimization dipole polarization {pol!r}.")
-
-    dipoles = []
-    for i in range(count):
-        row, col = divmod(i, grid_n)
-        x = float(xs[col])
-        y = float(ys[row])
-        dipoles.append(
-            {
-                "name": f"opt_dipole_{i}_{pol}",
-                "dipole_idx": i,
-                "dipole_x": x,
-                "dipole_y": y,
-                "dipole_z": float(G.eml_c[2]),
-                "polarization": pol,
-                "weight": 1.0,
-            }
-        )
-    return dipoles
 
 
 # =============================================================================
@@ -1167,81 +940,14 @@ def build_evenly_spaced_dipoles(G, pol="x"):
 # =============================================================================
 
 
-def channel_fom_terms(G, Ex, Ey, Hx, Hy, channel):
-    target = channel["angular_target"]
-    flux_sign = float(channel.get("last_top_flux_sign", 1.0))
-    total, fom, spec_p, profile, throughput, match = angular_powers(G, Ex, Ey, Hx, Hy, target, flux_sign)
-    return {"fom": fom, "spec_fracs": spec_p, "profile": profile, "total": total,
-            "throughput": throughput, "match": match}
 
 
-def combine_fom(G, vals):
-    vals = npa.where(npa.isfinite(vals), vals, 0.0)
-    vals = npa.maximum(vals, G.fom_floor)
-    vals = npa.reshape(vals, (-1,))
-    return npa.mean(vals) if vals.size else G.fom_floor
 
 
-def clean_fom_values(G, values):
-    return np.asarray(
-        [
-            max(float(np.nan_to_num(np.real(v[0] if isinstance(v, (list, tuple, np.ndarray)) else v), nan=G.fom_floor, posinf=G.score_cap, neginf=G.fom_floor)), G.fom_floor)
-            for v in values
-        ],
-        dtype=float,
-    )
 
 
-def measure_design_incident_reference(G, channel):
-    # Reference power incident on the design region from the dipole, measured with
-    # the design region AND everything above it filled with design material. That
-    # material (n=1.45) is index-matched to the SiO2 directly below, so there is no
-    # reflecting interface at or above the design's lower face: the net upward flux
-    # there is the pure incident power (no back-reflection from the design/superstrate).
-    ref = make_sim(G, [G.Sx, G.Sy, G.Sz])
-    # A channel may carry a whole coherent grid; the incident reference has to be
-    # measured with the SAME excitation or the normalization does not correspond
-    # to the run it normalizes.
-    pts = channel.get("dipoles")
-    if pts:
-        for k, (dx, dy, dz) in enumerate(pts):
-            add_dipole(G, ref, dx, dy, dz, channel["polarization"],
-                       name=f"opt_dipole_{k}", enabled=True, group_name="source")
-    else:
-        add_dipole(G, ref, channel["dipole_x"], channel["dipole_y"], channel["dipole_z"], channel["polarization"])
-    add_stack(G, ref)
-    fill_bottom = G.design_incident_monitor_c[2]
-    fill_h = G.Z_max - fill_bottom
-    fill_c = [0.0, 0.0, fill_bottom + 0.5 * fill_h]
-    ref.add_geo(fill_c, [G.Sx, G.Sy, fill_h], G.design_high_index, "design_incident_fill", float(np.mean(G.visible_wavelengths)))
-    ref.add_monitor(G.design_incident_monitor_name, G.design_incident_monitor_c, G.design_incident_monitor_s)
-    ref.run(name=f"design_incident_reference_{channel['dipole_idx']}", save=True)
-    load_run_results(ref)
-    freqs = source_freqs(G, ref)
-    source_power = read_source_power(ref.fdtd, freqs)
-    T_incident = read_transmission(ref.fdtd, G.design_incident_monitor_name)
-    incident_power = abs(T_incident) * source_power if valid_power(source_power) is not None else None
-    try:
-        ref.fdtd.close()
-    except Exception:
-        pass
-    incident_power = valid_power(incident_power)
-    print(
-        f"[incident-ref] channel {channel['dipole_idx']}: T={T_incident:.6e}, "
-        f"source_power={valid_power(source_power) or float('nan'):.6e}, "
-        f"incident_power={incident_power if incident_power is not None else float('nan'):.6e}"
-    )
-    return incident_power
 
 
-def raw_monitor_flux(fdtd, monitor_name, target, flux_sign):
-    try:
-        E = np.asarray(fdtd.getresult(monitor_name, "E")["E"], dtype=np.complex128)
-        H = np.asarray(fdtd.getresult(monitor_name, "H")["H"], dtype=np.complex128)
-        pz = 0.5 * np.real(E[..., 0] * np.conj(H[..., 1]) - E[..., 1] * np.conj(H[..., 0]))
-        return max(float(flux_sign) * float(np.sum(pz)) * float(target["monitor_cell_area"]), 0.0)
-    except Exception:
-        return None
 
 
 def design_to_grid(G, design, mapping=None, beta=1.0):
@@ -1265,52 +971,8 @@ def design_to_grid(G, design, mapping=None, beta=1.0):
     raise ValueError(f"expected {G.design_cells}, mapped-parameter, or {Nx * Ny} design values, got {rho.size}")
 
 
-def format_design_plot_status(f0_vals=None, last_plot_state=None):
-    lines = []
-    if f0_vals is not None:
-        vals = np.asarray(f0_vals, dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size:
-            lines.append(f"FoM mean={np.mean(vals):.3e}, min={np.min(vals):.3e}, max={np.max(vals):.3e}")
-    metrics = last_plot_state.get("last_fom_metrics") if isinstance(last_plot_state, dict) else None
-    if isinstance(metrics, dict):
-        for label, key in (("throughput", "throughput"), ("match", "match")):
-            val = metrics.get(key)
-            if val is not None and np.isfinite(val):
-                lines.append(f"{label}={float(val):.3f}")
-    return "\n".join(lines)
 
 
-def save_current_design_sections(G, design, f0_vals=None, mapping=None, last_plot_state=None):
-    rho = design_to_grid(G, npa.clip(design, 0.0, 1.0), mapping)
-    Nx, Ny, Nz = G.design_grids
-    x_axis = np.linspace(-0.5 * G.design_s[0], 0.5 * G.design_s[0], Nx)
-    y_axis = np.linspace(-0.5 * G.design_s[1], 0.5 * G.design_s[1], Ny)
-    z_axis = np.linspace(G.design_c[2] - 0.5 * G.design_s[2], G.design_c[2] + 0.5 * G.design_s[2], Nz)
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.8))
-    axes[0].imshow(rho[:, :, Nz // 2].T, origin="lower", extent=(x_axis[0], x_axis[-1], y_axis[0], y_axis[-1]), cmap="binary", vmin=0.0, vmax=1.0, aspect="equal", interpolation="nearest")
-    axes[0].set_xlabel("x (um)")
-    axes[0].set_ylabel("y (um)")
-    axes[0].set_title("x-y section at z=center")
-
-    axes[1].imshow(rho[:, Ny // 2, :].T, origin="lower", extent=(x_axis[0], x_axis[-1], z_axis[0], z_axis[-1]), cmap="binary", vmin=0.0, vmax=1.0, aspect="equal", interpolation="nearest")
-    axes[1].set_xlabel("x (um)")
-    axes[1].set_ylabel("z (um)")
-    axes[1].set_title("x-z section at y=0")
-
-    status_text = format_design_plot_status(f0_vals, last_plot_state)
-    fig.suptitle("Current design sections")
-    if status_text:
-        fig.text(0.5, 0.02, status_text, ha="center", va="bottom", fontsize=8.5)
-        fig.tight_layout(rect=(0.0, 0.16, 1.0, 0.92))
-    else:
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
-
-    path = os.path.join(G.design_dir, "design_iter_temp.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    return path
 
 
 def save_final_structure(G, design, mapping=None, prefix="OLED_final_structure"):
@@ -1397,59 +1059,6 @@ def save_final_structure(G, design, mapping=None, prefix="OLED_final_structure")
     return png_path
 
 
-def adjoint_loop(G, opts, iter_plot_fn=None, combine=None):
-    """Adjoint-loop factory for ms.Opt_MS2.OPT_Ms, ported from OLED_new.py.
-
-    iter_plot_fn(X, vals), if given, is called once per non-string forward
-    evaluation at exactly the point where OLED_new.py saved its per-iteration
-    design-section / field-snapshot / emission plots; the calling script
-    supplies a callback that performs its own plotting there.  combine, if
-    given, replaces the default mean combine_fom (OLED_lens uses a
-    channel-weighted combiner); it is also the function differentiated by
-    autograd in the Case == 3 branch.
-    """
-    if combine is None:
-        def combine(vals):
-            return combine_fom(G, vals)
-
-    N_fom = len(opts)
-
-    def loop(X, N_cases, Case=True):
-        if Case == 3:
-            vals = npa.maximum(npa.asarray(clean_fom_values(G, N_cases)), G.fom_floor)
-            coeffs = npa.where(npa.isfinite(ag_jacobian(combine)(vals)), ag_jacobian(combine)(vals), 0.0)
-            grad = 0.0
-            for c, g in zip(coeffs, X[0]):
-                grad = grad + c * npa.where(npa.isfinite(npa.array(g)), npa.array(g), 0.0)
-            print(f"[outcoupling] combined grad max={np.max(np.abs(grad)):.6e}")
-            return npa.where(npa.isfinite(grad), grad, 0.0)
-
-        f0s, grads = [0] * N_fom, [0] * N_fom
-        for i, opt in enumerate(opts):
-            if isinstance(X, str):
-                f0s[i], grads[i] = opt(need_gradient=Case)
-            else:
-                f0s[i], grads[i] = opt(rho_vector=[npa.clip(X, 0.0, 1.0)], need_gradient=Case)
-
-        if any(getattr(opt, "last_forward_had_nonfinite", False) for opt in opts):
-            zero_grads = [np.zeros_like(g, dtype=float) if not isinstance(g, (int, float)) else np.zeros(G.design_cells) for g in grads]
-            return (G.unstable_candidate_fom, [G.fom_floor] * N_fom, zero_grads) if Case and not isinstance(X, str) else zero_grads
-
-        vals = clean_fom_values(G, f0s)
-
-        if not isinstance(X, str) and iter_plot_fn is not None:
-            try:
-                iter_plot_fn(X, vals)
-            except Exception as exc:
-                print(f"[outcoupling] skipped per-iteration plots: {exc}")
-
-        combined = combine(vals)
-        print(f"[outcoupling] combined FoM={combined:.6e}, mean={np.mean(vals):.6e}, min={np.min(vals):.6e}, max={np.max(vals):.6e}")
-        if Case:
-            return grads if isinstance(X, str) else (combined, f0s, grads)
-        return combined, f0s
-
-    return loop
 
 
 # =============================================================================
@@ -1639,88 +1248,10 @@ def render_xz_field_image(res, path, title, cmap="hot"):
     return path
 
 
-def save_xz_monitor_field_snapshot(G, problem=None):
-    try:
-        sim = getattr(problem, "sim", None) if problem is not None else None
-        if sim is None or not hasattr(sim, "fdtd"):
-            return None
-        return render_xz_field_image(
-            sim.fdtd.getresult(G.xyz_monitor_name, "E"),
-            os.path.join(G.design_dir, "xz_monitor_field.png"),
-            "XZ monitor plane |E| (full simulation cross-section)",
-        )
-    except Exception:
-        return None
 
 
-def save_fom_monitor_field_snapshot(G, problem=None):
-    try:
-        if problem is None:
-            return None
-        fdtd = getattr(problem, "sim", None)
-        if fdtd is None or not hasattr(fdtd, "fdtd"):
-            return None
-        fdtd_obj = fdtd.fdtd
-        res = fdtd_obj.getresult(G.target_monitor_name, "E")
-        E = np.asarray(res["E"], dtype=np.complex128)
-        if E.size == 0:
-            return None
-        field_mag = np.sqrt(np.sum(np.abs(E) ** 2, axis=-1))
-        if field_mag.ndim >= 2:
-            field_mag = np.squeeze(field_mag)
-        x = np.asarray(res.get("x", np.arange(field_mag.shape[1])), dtype=float).reshape(-1)
-        y = np.asarray(res.get("y", np.arange(field_mag.shape[0])), dtype=float).reshape(-1)
-        if field_mag.ndim == 1:
-            field_mag = field_mag.reshape(1, -1)
-        if field_mag.shape[0] != y.size or field_mag.shape[1] != x.size:
-            field_mag = np.reshape(field_mag, (y.size, x.size))
-        fig, ax = plt.subplots(figsize=(5.2, 4.8))
-        im = ax.imshow(field_mag.T, origin="lower", extent=(x[0], x[-1], y[0], y[-1]), cmap="viridis", aspect="equal")
-        ax.set_xlabel("x (um)")
-        ax.set_ylabel("y (um)")
-        ax.set_title("FoM monitor plane |E|")
-        fig.colorbar(im, ax=ax, pad=0.03)
-        fig.tight_layout()
-        path = os.path.join(G.design_dir, "fom_monitor_field.png")
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
-        return path
-    except Exception:
-        return None
 
 
-def save_angular_target_preview(G, angular_target, file_prefix="OLED_angular_target"):
-    # The FoM basis: the continuous linear-ramp target across the in-range emission
-    # angles (control points marked), normalized to sum 1 in-range.
-    thetas = np.asarray(angular_target["angle_thetas"], dtype=float)
-    target = np.asarray(angular_target["target_profile"], dtype=float)
-    inr = np.asarray(angular_target["in_range"], dtype=float) > 0.5
-    ctrl_a = np.asarray(angular_target["spec_snapped"], dtype=float)
-    ctrl_r = np.asarray(angular_target["ctrl_ratios"], dtype=float)
-
-    fig, ax = plt.subplots(figsize=(7.5, 4))
-    ax.bar(thetas[inr], target[inr], width=1.8, color="tab:red", alpha=0.75, label="target profile (in-range)")
-    ax.plot(thetas, np.zeros_like(thetas), "k|", markersize=14, label="available angles")
-    # Show the underlying ramp (control ratios) on a twin axis for reference.
-    axr = ax.twinx()
-    axr.plot(ctrl_a, ctrl_r, "o--", color="tab:blue", lw=1.5, label="control ratio ramp")
-    axr.set_ylabel("control ratio (relative)", color="tab:blue")
-    axr.set_ylim(0.0, 1.1 * max(float(np.max(ctrl_r)), 1e-9))
-    for th, t in zip(thetas[inr], target[inr]):
-        ax.annotate(f"{th:.1f}\n{t:.2f}", (th, t), textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
-    ax.set_xlabel("emission angle theta (deg)")
-    ax.set_ylabel("target power fraction (in-range, sums to 1)")
-    basis = "2D k-space (all m,n orders)" if angular_target.get("mode") == "kspace_2d" else "phi=0 line (m,0 orders)"
-    ax.set_title(f"Angular target profile [{basis}]: linear ratio ramp")
-    ax.set_xlim(-3.0, 92.0)
-    ax.set_ylim(0.0, max(1.35 * float(np.max(target)) if target.size else 1.0, 0.05))
-    ax.legend(fontsize=8, loc="upper right")
-    fig.tight_layout()
-    path = os.path.join(G.design_dir, f"{file_prefix}.png")
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    np.savez(os.path.join(G.design_dir, f"{file_prefix}.npz"), angle_thetas=thetas, target_profile=target, in_range=inr)
-    print(f"[target] saved angular target profile: {path}")
 
 
 def load_planar_reference_lee(path):
@@ -1859,8 +1390,122 @@ def render_emission_figure(angles, radiance_signed_norm, target_norm, order_thet
     plt.close(fig)
 
 
+PLANAR_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "Planer_data.txt")
+
+
+def planar_reference_identity(G=None, grid_n=None):
+    """What the cached planar curve has to agree with to be comparable.
+
+    One global file at a fixed path, read by every later run, is exactly the
+    shape of cache that goes stale silently: change the stack colour, the
+    wavelength, the pitch or the dipole grid and the black overlay in
+    PP_summary.png is still drawn, just no longer describing this device. So the
+    identity is written INTO the file and checked on load -- the same discipline
+    pp_cache_key uses, which this file predates.
+    """
+    if G is None:
+        return None
+    return "|".join(str(v) for v in (
+        # FORMAT TAG. "abs1" = the curve is radiance per unit emitted power.
+        # Files written before that carried a peak-normalized curve instead, which
+        # the overlay would now divide by an absolute 0 deg value and put six
+        # orders of magnitude off the axis. Bump this whenever the stored quantity
+        # changes, so an old file is refused rather than misread.
+        "abs1",
+        os.environ.get("MSOPT_MC_COLOR", os.environ.get("MSOPT_OLED_MC_COLOR", "green")),
+        os.environ.get("MSOPT_MC_STACK_KIND", "optimized"),
+        os.environ.get("MSOPT_OLED_STACK", "microcavity"),
+        round(float(np.mean(G.visible_wavelengths)), 6),
+        round(float(G.Sx), 6), round(float(G.Sy), 6),
+        round(float(G.target_monitor_c[2]), 6),
+        int(G.resolution),
+        int(grid_n) if grid_n is not None else "?",
+        os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT", "cell_center").strip().lower(),
+    ))
+
+
+def save_planar_reference_curve(angles, radiance_signed_abs, lee=None,
+                                path=PLANAR_DATA_PATH, identity=None):
+    """Persist the PLANAR device's angular radiance next to the scripts.
+
+    Stored in ABSOLUTE units -- radiance per unit emitted power -- because every
+    future run divides it by ITS OWN 0 deg radiance to place it, and a curve
+    already divided by its own peak carries no level information to place.
+    (It used to be handed radiance_signed_norm, which IS peak-normalized, so the
+    overlay silently compared shapes only; see render_pp_summary_figure.)
+    Written once, on the first planar postprocess, and read back by every run
+    after that, so the reference costs one simulation ever -- which is why it
+    also carries the identity it was measured under.
+    """
+    ang = np.asarray(angles, dtype=float)
+    arr = np.asarray(radiance_signed_abs, dtype=float)
+    pos = arr[ang.size - 1:]
+    neg = arr[:ang.size][::-1]
+    curve = 0.5 * (pos + neg)                     # +/-kx averaged, still raw
+    header = ("planar reference radiance, ABSOLUTE: per unit emitted power.\n"
+              "NOT divided by its own peak or its own 0 deg -- the overlay divides\n"
+              "it by THIS design's 0 deg value, so the dashed line's height is real.\n"
+              f"lee {'' if lee is None else float(lee)}\n"
+              f"identity {identity if identity else 'unknown'}\n"
+              "theta_deg  radiance")
+    np.savetxt(path, np.column_stack([ang, curve]), header=header)
+    print(f"[postprocess] saved planar reference curve -> {path}")
+    return path
+
+
+def load_planar_reference_curve(path=PLANAR_DATA_PATH, identity=None):
+    """The stored planar curve, or None when it is missing or was measured under
+    a different configuration.
+
+    Refusing beats overlaying: a missing black line is obviously missing, while a
+    wrong one is read as truth. Files written before the identity existed are
+    also refused -- they cannot be shown to match.
+    """
+    if not os.path.exists(path):
+        return None, None
+    if identity is not None:
+        stored = None
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    if not line.startswith("#"):
+                        break
+                    body = line.lstrip("# ").rstrip()
+                    if body.startswith("identity "):
+                        stored = body.split(" ", 1)[1]
+        except Exception:
+            stored = None
+        if stored != identity:
+            print(f"[postprocess] planar reference SKIPPED: measured under "
+                  f"{stored!r}, this run is {identity!r}. Re-measure with "
+                  f"MSOPT_OLED_PP_PLANAR=low to restore the overlay.")
+            return None, None
+    try:
+        d = np.atleast_2d(np.loadtxt(path))
+        if d.shape[1] < 2 or d.shape[0] < 2:
+            return None, None
+        lee = None
+        with open(path) as fh:
+            for line in fh:
+                if not line.startswith("#"):
+                    break
+                if line.lstrip("# ").startswith("lee "):
+                    tok = line.lstrip("# ").split()
+                    if len(tok) > 1:
+                        try:
+                            lee = float(tok[1])
+                        except ValueError:
+                            lee = None
+        return d[:, 0], (d[:, 1], lee)
+    except Exception as exc:
+        print(f"[postprocess] planar reference unreadable ({exc}); ignoring")
+        return None, None
+
+
 def render_pp_summary_figure(angles, radiance_signed_norm, target_norm, path,
-                             lee=None, planar_lee=None):
+                             lee=None, planar_lee=None, planar_identity=None,
+                             radiance_signed_abs=None):
     """PP_summary.png -- the radiance, twice: as the polar lobe and as the same
     curve unrolled onto a linear theta axis.
 
@@ -1910,6 +1555,32 @@ def render_pp_summary_figure(angles, radiance_signed_norm, target_norm, path,
         if abs(float(t[0])) > 1e-30:
             ax1.plot(ang, t / float(t[0]) * 100.0, lw=1.4, ls="--", color="tab:orange",
                      label="target")
+    # PLANAR overlay, divided by THIS DESIGN's 0 deg radiance -- both curves in
+    # ABSOLUTE per-emitted-power units, so the dashed line's HEIGHT is meaningful:
+    # above 100% means the flat stack is brighter in that direction than this
+    # design is on axis.
+    #
+    # It used to be scaled by the design's 0 deg value too, but the quantity being
+    # scaled was radiance_signed_norm -- already divided by its OWN peak. Both
+    # curves therefore landed at ~100% at 0 deg and only their SHAPES could be
+    # compared, which reads as "the design beats planar everywhere past 25 deg"
+    # while the design actually extracts LESS light in total (LEE 41.2% against
+    # the planar 44.7%). Absolute units are what make that visible.
+    p_ang, p_pack = load_planar_reference_curve(identity=planar_identity)
+    abs_arr = None if radiance_signed_abs is None else np.asarray(radiance_signed_abs, dtype=float)
+    r0_abs = float(abs_arr[n - 1]) if abs_arr is not None and abs_arr.size >= n else 0.0
+    if p_ang is not None and abs(r0_abs) > 1e-30:
+        p_curve, _p_lee = p_pack
+        p_rel = np.asarray(p_curve, dtype=float) / r0_abs * 100.0
+        ax1.plot(p_ang, p_rel, lw=1.5, ls="--", color="black",
+                 label="planar reference (absolute)")
+        planar_on_axis = float(p_rel[0]) if p_rel.size else float("nan")
+    elif p_ang is not None:
+        print("[postprocess] planar overlay skipped: no absolute radiance available "
+              "(radiance_signed_abs not supplied)")
+        planar_on_axis = float("nan")
+    else:
+        planar_on_axis = float("nan")
     ax1.axhline(100.0, lw=1.0, ls=":", color="0.55", label="Lambertian (constant)")
     ax1.set_xlim(0.0, 90.0)
     ax1.set_xticks(np.arange(0.0, 91.0, 10.0))
@@ -1923,6 +1594,8 @@ def render_pp_summary_figure(angles, radiance_signed_norm, target_norm, path,
     # so the percentages can be quoted off the figure without measuring pixels.
     marks = [a for a in (30.0, 45.0, 60.0) if a <= float(ang[-1])]
     rows = [f"0deg = 100.0%  (reference)"]
+    if planar_on_axis == planar_on_axis:      # not NaN
+        rows.append(f"planar 0deg = {planar_on_axis:5.1f}%")
     for a in marks:
         v = float(np.interp(a, ang, 0.5 * (pos + neg) * scale))
         ax1.plot([a], [v], "o", ms=4, color="tab:blue")
@@ -2010,71 +1683,6 @@ def save_per_dipole_emission_plot(G, angles, per_dipole, path):
     return path
 
 
-def save_optimization_emission_plot(G, target_channels=None, last_plot_state=None):
-    # Save the single-channel emission performance versus angle as a PNG.
-    ch = target_channels[0] if target_channels else None
-    prof = None
-    at = None
-    if isinstance(ch, dict):
-        prof = ch.get("last_angle_profile")
-        at = ch.get("angular_target")
-    if prof is None and isinstance(last_plot_state, dict):
-        prof = last_plot_state.get("last_angle_profile")
-        at = last_plot_state.get("angular_target")
-    if prof is None and at is None:
-        fig, ax = plt.subplots(figsize=(8.5, 4))
-        ax.text(0.5, 0.5, "No emission profile available", ha="center", va="center")
-        ax.set_axis_off()
-        path = os.path.join(G.design_dir, "OLED_opt_emission.png")
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
-        return path
-
-    if prof is not None and at is not None:
-        achieved = np.asarray(prof, dtype=float).reshape(-1)
-        thetas = np.asarray(at["angle_thetas"], dtype=float).reshape(-1)
-        inr = np.asarray(at["in_range"], dtype=float).reshape(-1) > 0.5
-        tgt = np.asarray(at["target_profile"], dtype=float).reshape(-1)
-        thru = float(np.sum(achieved[inr]))
-        target = tgt * thru
-        q = achieved / max(thru, 1e-30)
-        match = float(np.sum(np.minimum(q[inr], tgt[inr])))
-        fom = thru * match ** G.ratio_emphasis
-    else:
-        achieved = np.asarray([0.0], dtype=float)
-        thetas = np.asarray([0.0], dtype=float)
-        inr = np.asarray([True], dtype=bool)
-        tgt = np.asarray([0.0], dtype=float)
-        target = np.asarray([0.0], dtype=float)
-        q = np.asarray([0.0], dtype=float)
-        thru = 0.0
-        match = 0.0
-        fom = 0.0
-
-    fig, ax = plt.subplots(figsize=(8.5, 4))
-    xpos = np.arange(thetas.size)
-    bw = 0.4
-    ax.bar(xpos - 0.5 * bw, target, width=bw, label=r"target $t_k\cdot T$ (linear ramp)", color="tab:orange")
-    ax.bar(xpos + 0.5 * bw, achieved, width=bw, label="achieved (of total)", color="tab:blue")
-    for idx in np.where(inr)[0]:
-        ax.annotate(f"q={q[idx]:.2f}", (xpos[idx] + 0.5 * bw, achieved[idx]),
-                    textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8, color="tab:blue")
-    ax.set_xticks(xpos)
-    ax.set_xticklabels([f"{t:.1f}" for t in thetas])
-    ax.set_xlabel("emission angle theta (deg)")
-    ax.set_ylabel("angular mode-power fraction (of total)")
-    basis = "2D k-space" if (at.get("mode") == "kspace_2d") else "phi=0 line"
-    ax.set_title(f"Angular mode power [{basis}], opt dipoles - FoM={fom:.3f}  thru={thru:.3f}  match={match:.3f}")
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    path = os.path.join(G.design_dir, "OLED_opt_emission.png")
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    np.savez(os.path.join(G.design_dir, "OLED_opt_emission.npz"),
-             angle_thetas=thetas, achieved=achieved, target=target, q=q, throughput=thru, in_range=inr.astype(float),
-             fom=np.asarray([fom]), throughput_metric=np.asarray([thru]), match_metric=np.asarray([match]))
-    return path
 
 
 # =============================================================================
@@ -2082,17 +1690,18 @@ def save_optimization_emission_plot(G, target_channels=None, last_plot_state=Non
 # =============================================================================
 
 
-def central_cell_dipoles(G, n_samples, pol="x"):
+def central_cell_dipoles(G, n_samples, pol="x", grid_n=None):
     # Same seeded positions regardless of pol, so a polarization sweep re-samples the
     # identical dipole locations and only the orientation changes.
     pol = str(pol).strip().lower()
     # The validated Meep reference uses a 6x6 endpoint grid inset by two mesh
-    # pixels from the emission-region boundary. Run every point for asymmetric
-    # optimized designs; the reference's 9-run/multiplicity shortcut is valid
-    # only when geometric mirror symmetry is guaranteed.
-    grid_n = env_int("MSOPT_OLED_PP_DIPOLE_GRID", 6)
+    # pixels from the emission-region boundary, and runs every point. Its
+    # 9-run/multiplicity shortcut is valid only when geometric mirror symmetry is
+    # guaranteed -- which resolve_dipole_grid now decides from the density grid
+    # itself, and passes in as grid_n. None keeps the standalone default.
+    grid_n = env_int("MSOPT_OLED_PP_DIPOLE_GRID", 6) if grid_n is None else int(grid_n)
     if grid_n > 0:
-        protocol = os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT", "validated_endpoint").strip().lower()
+        protocol = os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT", "cell_center").strip().lower()
         if protocol not in ("validated_endpoint", "cell_center"):
             raise ValueError(
                 "MSOPT_OLED_PP_SOURCE_LAYOUT must be 'validated_endpoint' or 'cell_center'."
@@ -2115,6 +1724,105 @@ def central_cell_dipoles(G, n_samples, pol="x"):
         (float(rng.uniform(-0.5 * G.active_x, 0.5 * G.active_x)), float(rng.uniform(-0.5 * G.active_y, 0.5 * G.active_y)), float(G.eml_c[2]), pol)
         for _ in range(n_samples)
     ]
+
+
+def mirror_orbits(grid_n):
+    """Group the dipole grid into orbits of the two mirror planes x->-x, y->-y.
+
+    Both source layouts central_cell_dipoles can build are symmetric about the
+    cell centre, so grid index (ix, iy) -- flattened as ix*n + iy, the order
+    central_cell_dipoles emits -- pairs with (n-1-ix, iy), (ix, n-1-iy) and
+    (n-1-ix, n-1-iy).  For a design whose geometry carries those mirrors, all
+    four are the SAME simulation: an electric dipole is a true vector, so a
+    reflection that maps the structure onto itself maps an x-oriented source at
+    (x, y) onto an x-oriented source at (-x, y) (the sign of the moment flips
+    with the field, and |E|^2 does not see it).  The far field of the image is
+    the reflected far field, which is why the caller has to flip the spectrum.
+
+    Returns [(rep, [(member, flip_x, flip_y), ...]), ...], every index covered
+    exactly once, rep first.  With an odd grid_n the centre row/column is its
+    own image and the orbit is correspondingly smaller -- membership is built
+    from the index set, not assumed to be 4.
+    """
+    n = int(grid_n)
+    seen, out = set(), []
+    for ix in range(n):
+        for iy in range(n):
+            rep = ix * n + iy
+            if rep in seen:
+                continue
+            members = []
+            for jx, fx in ((ix, False), (n - 1 - ix, True)):
+                for jy, fy in ((iy, False), (n - 1 - iy, True)):
+                    m = jx * n + jy
+                    if m not in {mm for mm, _a, _b in members}:
+                        members.append((m, fx, fy))
+            seen.update(m for m, _a, _b in members)
+            out.append((rep, members))
+    return out
+
+
+def resolve_dipole_grid(rho):
+    """Decide the dipole grid AND whether the C4v fold applies, in one place.
+
+    THE POINT OF THE DEFAULT: a mirror-symmetric design makes each orbit of four
+    grid points one simulation, so the 6x6 grid's 36 runs only ever held 9
+    independent numbers -- three quarters of the sweep was paid for and
+    discarded. Rather than bank that as a speedup, the default spends it on
+    RESOLUTION: 12x12 folded is the same 36 FDTD runs as 6x6 unfolded, with 36
+    independent samples instead of 9 and a sampling Nyquist of 6 per period
+    instead of 3. The measured driver is that the per-dipole LEE varies ~26%
+    peak-to-peak across the cell while its second difference exceeds its first,
+    i.e. the 6-point grid sits at or past its own resolution limit.
+
+    An asymmetric design cannot fold, and there the grid stays 6x6 -- 12x12
+    unfolded would be 144 runs, quadrupling the cost of every postprocess.
+    So the FDTD count is 36 either way and only the sampling changes.
+
+    MSOPT_OLED_PP_SYMMETRY_FOLD: "auto" (default) folds when the density grid
+    actually carries both mirrors, "1" demands it and fails if it does not, "0"
+    disables it. MSOPT_OLED_PP_DIPOLE_GRID still overrides the grid explicitly.
+
+    Returns (grid_n, fold_on, asymmetry).
+    """
+    asym = design_mirror_asymmetry(rho)
+    symmetric = asym <= env_float("MSOPT_OLED_PP_SYMMETRY_TOL", 1e-9)
+    mode = os.environ.get("MSOPT_OLED_PP_SYMMETRY_FOLD", "auto").strip().lower() or "auto"
+    if mode in ("1", "true", "yes", "on"):
+        if not symmetric:
+            raise ValueError(
+                f"MSOPT_OLED_PP_SYMMETRY_FOLD=1 needs a mirror-symmetric design, but the "
+                f"density grid deviates from its own mirror image by {asym:.3e}. "
+                f"Use 'auto' to fall back to the full grid, or fix the design symmetry."
+            )
+        fold_on = True
+    elif mode in ("0", "false", "no", "off"):
+        fold_on = False
+    elif mode == "auto":
+        fold_on = symmetric
+    else:
+        raise ValueError("MSOPT_OLED_PP_SYMMETRY_FOLD must be auto, 0 or 1, "
+                         f"got {mode!r}")
+    grid_n = env_int("MSOPT_OLED_PP_DIPOLE_GRID", 12 if fold_on else 6)
+    # grid_n <= 0 selects the random-sample layout, which has no mirror pairing.
+    if grid_n <= 0:
+        fold_on = False
+    return grid_n, fold_on, asym
+
+
+def design_mirror_asymmetry(rho):
+    """Max relative deviation of the design from its own x and y mirror images.
+
+    The postprocess symmetry fold is only valid if the STRUCTURE actually has
+    those mirrors.  Rather than trust a symmetry flag set in another file, this
+    measures the density grid that is about to be built, so a design that lost
+    its symmetry (or was never constrained to it) cannot silently be scored
+    from a quarter of the dipoles.
+    """
+    r = np.asarray(rho, dtype=float)
+    scale = max(float(np.max(np.abs(r))), 1e-30)
+    return max(float(np.max(np.abs(r - r[::-1, ...]))),
+               float(np.max(np.abs(r - r[:, ::-1, ...])))) / scale
 
 
 def minimum_source_box_clearance(sources, center, size):
@@ -2711,821 +2419,236 @@ def load_pp_case(cache_dir, pol, idx, key):
         return None
 
 
-def run_postprocess(G, final_design, mapping=None, performance_spec=None):
-    pp_t0 = time.time()
-    # MSOPT_OLED_PP_PLANAR discards the design and characterizes an UNPATTERNED
-    # stack through the exact same pipeline, so its outputs are directly
-    # comparable folder-to-folder and give the reference every enhancement
-    # factor needs.  Two readings of "no design structure", both supported:
-    #   low  (= "1", default) : design region = low index (air) -- nothing at
-    #                           all on top of the stack
-    #   high                  : design region = high index -- a flat slab of the
-    #                           design material (isolates PATTERNING from the
-    #                           mere presence of the layer)
-    planar_mode, planar_baseline = planar_request()
-    if planar_baseline:
-        if planar_mode not in ("1", "true", "yes", "on", "low", "high"):
-            raise ValueError("MSOPT_OLED_PP_PLANAR must be 0, 1/low, or high.")
-        fill = 1.0 if planar_mode == "high" else 0.0
-        final_design = np.full(int(np.prod(G.design_grids)), fill, dtype=float)
-        mapping = None
-        which = "high index (flat slab of design material)" if fill else "low index (bare stack, nothing on top)"
-        print(f"[postprocess] PLANAR BASELINE: design discarded, design region = {which}")
-    # Case cache. Defaults to this run's own folder; MSOPT_OLED_PP_CACHE_DIR can point
-    # at a previous run's cache to finish a postprocess that died part-way.
-    pp_cache_dir = os.environ.get(
-        "MSOPT_OLED_PP_CACHE_DIR", os.path.join(G.design_dir, "pp_cache")).strip()
-    rho = design_to_grid(G, final_design, mapping)
-    if np.asarray(G.visible_wavelengths).size != 1:
-        raise ValueError(
-            "OLED postprocess currently requires one wavelength; transmission, "
-            "dipole power, and angular spectra must be accumulated per wavelength."
-        )
+def _postprocess_coherence_audit(
+        *, G,
+        sim,
+        manifest,
+        records,
+        pols,
+        n_dipoles,
+        pp_grid_n,
+        z_shift,
+        source_flux_box_faces,
+        coh_cases,
+        rand_trial_profiles,
+        _case_spectrum,
+        _drop_last_fsp,
+        _write_manifest):
+    """The optional step2b coherence audit, lifted out of run_postprocess.
 
-    # Record WHICH structure these results belong to, before any simulation runs:
-    # the design usually comes from another run's lastdesign.txt, so the result
-    # folder would otherwise not contain the geometry it characterizes.
-    try:
-        save_final_structure(G, final_design, mapping)
-    except Exception as exc:
-        print(f"[postprocess] warning: could not save final structure: {exc}")
+    Gated by MSOPT_OLED_PP_COHERENT_CHECK, which defaults OFF, so this is 167
+    lines the main postprocess path never executes -- the clearest seam in a
+    function that had grown to 1375 lines.
 
-    # --- Far-field geometry ----------------------------------------------------
-    # Two modes (MSOPT_OLED_PP_MODE):
-    #   single (alias "n2f"): SINGLE cell + PML; the angular
-    #        spectrum comes from the near-to-far projection of the top monitor,
-    #        so no tiling and no tall air gap are needed. Caveat: the periodic
-    #        array is truncated at the cell edge -- guided light reaching the
-    #        PML is absorbed instead of scattering at neighbour cells, so LEE
-    #        and order sharpness are approximations of the tiled reference.
-    #   supercell (alias "tile", the default): NxN tiling with the monitor
-    #        geometrically sized to capture pp_max_angle_deg from the central
-    #        cell (exact but expensive).
-    pp_mode = os.environ.get("MSOPT_OLED_PP_MODE", "supercell").strip().lower()
-    if pp_mode not in ("single", "n2f", "supercell", "tile"):
-        raise ValueError("MSOPT_OLED_PP_MODE must be 'single' (alias 'n2f') or 'supercell' (alias 'tile').")
-    pp_mode = {"n2f": "single", "tile": "supercell"}.get(pp_mode, pp_mode)
-    # Match the validated scripts: monitors are separated from the PML by the
-    # PML thickness plus a two-pixel gap, rather than sitting 0.15 um from the
-    # outer boundary where they may overlap the absorbing layer.
-    monitor_boundary_inset = env_float(
-        "MSOPT_OLED_PP_MONITOR_BOUNDARY_INSET_UM",
-        0.50 + 2.0 / max(float(G.pp_resolution), 1.0),
-    )
-    # Lateral size is set by the CAPTURE ANGLE, in both modes.
-    #
-    # near2far projects the field ON the monitor, so light that leaves through
-    # the lateral PML before reaching the monitor plane is simply absent from
-    # its input -- the projection cannot recover it. Measured directly: the same
-    # stack and the same farfield3d gave LEE 47.1 % at 2.72 um lateral and
-    # 58.3 % at 5.65 um. So the domain must be wide enough that
-    #     monitor half-width >= h * tan(capture) ,
-    # where h is measured from the LAST SOLID INTERFACE the light leaves -- the
-    # top of the stack, not the top of the design region. Using the design top
-    # under-counts h by the design thickness and silently narrows the capture
-    # (60 deg instead of the intended 69 deg in one run).
-    capture_deg = env_float("MSOPT_OLED_PP_CAPTURE_ANGLE_DEG", G.pp_max_angle_deg)
-    stack_top = max(l["center"][2] + 0.5 * l["size"][2] for l in G.stack_layers)
+    Everything it touches is passed in by keyword under its ORIGINAL name, so
+    the body below is byte-identical to what lived inline. That is deliberate:
+    the point of the move is to shorten run_postprocess, and it must not be
+    able to change a published number. coh_cases and rand_trial_profiles are
+    appended to IN PLACE, so the caller sees the results; coherence_summary is
+    written into manifest here and never read outside.
+    """
+    # The coherence cases fire EVERY grid point at once, so they get the full
+    # layout regardless of the fold -- there is no per-source result to
+    # reconstruct from a mirror image here, only one simultaneous run.
+    pts = central_cell_dipoles(G, n_dipoles, pols[0], grid_n=pp_grid_n)
+    sim.fdtd.switchtolayout()
+    delete_object(sim.fdtd, "postprocess_dipole")
+    for k, (cx, cy, cz, cpol) in enumerate(pts):
+        add_dipole(G, sim, cx, cy, cz + z_shift, cpol, f"coherent_dipole_{k:03d}")
+    reference_records = [rec for rec in records if rec[4] == pols[0]]
+    reference_power = float(np.sum([rec[9] for rec in reference_records]))
+    reference_top = float(np.sum([rec[10] for rec in reference_records]))
+    reference_eta = reference_top / max(reference_power, G.channel_power_floor)
 
-    def _needed_half_width(monitor_z_, z_shift_):
-        h = max(monitor_z_ - (stack_top + z_shift_), 1e-6)
-        return h * float(np.tan(np.deg2rad(capture_deg))) + monitor_boundary_inset, h
-
-    if pp_mode == "single":
-        # n2f is a projection, so the monitor only has to clear the evanescent
-        # near field; keeping it LOW also keeps the escape cone narrow, which is
-        # what makes a modest domain sufficient.
-        pp_far = env_float("MSOPT_OLED_PP_N2F_FAR_Z_UM", 0.4)
-        post_sz = G.Sz + pp_far
-        z_shift = -0.5 * pp_far
-        monitor_z = 0.5 * post_sz - monitor_boundary_inset
-        tile_n = 1
-        half_needed, monitor_h = _needed_half_width(monitor_z, z_shift)
-        pad_env = os.environ.get("MSOPT_OLED_PP_N2F_PAD_UM")
-        pp_pad = (float(pad_env) if pad_env not in (None, "")
-                  else max(half_needed - 0.5 * G.Sx, 0.1))
-        post_sx, post_sy = G.Sx + 2.0 * pp_pad, G.Sy + 2.0 * pp_pad
-    else:
-        post_sz = G.Sz + G.pp_far_z_um
-        z_shift = -0.5 * G.pp_far_z_um              # keep the stack at the same height above the bottom
-        monitor_z = 0.5 * post_sz - monitor_boundary_inset
-        half_needed, monitor_h = _needed_half_width(monitor_z, z_shift)
-        tile_n = max(int(G.pp_min_tiles), int(np.ceil(2.0 * half_needed / G.Sx)))
-        if tile_n % 2 == 0:
-            tile_n += 1                              # odd -> there is a central cell
-        post_sx, post_sy = tile_n * G.Sx, tile_n * G.Sy
-
-    achieved_deg = float(np.degrees(np.arctan(
-        max(0.5 * post_sx - monitor_boundary_inset, 0.0) / max(monitor_h, 1e-9))))
-    print(f"[postprocess] capture: target {capture_deg:g} deg, monitor {monitor_h:.3f} um "
-          f"({monitor_h / float(np.mean(G.visible_wavelengths)):.2f} lambda) above the stack top, "
-          f"lateral {post_sx:g} um -> ACHIEVED {achieved_deg:.1f} deg")
-    if achieved_deg < capture_deg - 1.0:
-        print(f"[postprocess] WARNING: the domain only captures {achieved_deg:.1f} deg; "
-              "emission beyond that is absorbed by the lateral PML before it reaches "
-              "the monitor and is MISSING from the near2far input (LEE is a lower bound).")
-    post_monitor_s = [
-        post_sx - 2.0 * monitor_boundary_inset,
-        post_sy - 2.0 * monitor_boundary_inset,
-        0.0,
-    ]
-    if min(post_monitor_s[:2]) <= 0.0:
-        raise ValueError(
-            "Postprocess monitor span is non-positive; increase domain padding or "
-            "reduce MSOPT_OLED_PP_MONITOR_BOUNDARY_INSET_UM."
-        )
-    post_monitor_c = [0.0, 0.0, monitor_z]
-
-    cells = (post_sx * G.pp_resolution) * (post_sy * G.pp_resolution) * (post_sz * G.pp_resolution)
-    print(
-        f"[postprocess] mode={pp_mode}: {tile_n}x{tile_n} cell(s), domain "
-        f"{post_sx:g}x{post_sy:g}x{post_sz:g}um, monitor z={monitor_z:.2f}um, "
-        f"res={G.pp_resolution}, ~{cells/1e6:.0f}M cells"
-    )
-
-    sim = make_sim(G, [post_sx, post_sy, post_sz], bc_x="PML", bc_y="PML", res=G.pp_resolution)
-    add_stack(G, sim, span_x=post_sx, span_y=post_sy, z_offset=z_shift)
-    half = tile_n // 2
-    for ix in range(-half, half + 1):
-        for iy in range(-half, half + 1):
-            sim.add_design_grid(
-                f"design_{ix}_{iy}",
-                [ix * G.Sx, iy * G.Sy, G.design_c[2] + z_shift],
-                G.design_s,
-                G.design_high_index,
-                G.design_low_index,
-                G.design_grids,
-                rho,
-                float(np.mean(G.visible_wavelengths)),
-            )
-    sim.add_monitor(G.target_monitor_name, post_monitor_c, post_monitor_s)
-
-    # Validated step1/step2 normalization: total emitted power is the outward
-    # Poynting flux through a six-face box just inside the EML. dipolepower is
-    # retained as an independent cross-check, not silently treated as truth.
-    use_source_flux_box = env_flag("MSOPT_OLED_PP_SOURCE_FLUX_BOX", "1")
-    source_flux_box_faces = []
-    source_box_size = None
-    source_box_inset = None
-    if use_source_flux_box:
-        source_box_inset = (
-            # Meep tolerates a point source exactly on a flux-region face, but
-            # Lumerical does not: edge/corner sources then lose roughly 1/2 or
-            # 3/4 of their box-normalization power.  Keep the validated source
-            # grid at a two-pixel inset and place the box one pixel from the EML
-            # boundary so every source is strictly enclosed.
-            env_float("MSOPT_OLED_PP_SOURCE_BOX_INSET_PIXELS", 1.0)
-            / max(float(G.pp_resolution), 1.0)
-        )
-        source_box_size = [
-            G.active_x - 2.0 * source_box_inset,
-            G.active_y - 2.0 * source_box_inset,
-            G.eml_h - 2.0 * source_box_inset,
-        ]
-        source_flux_box_faces = add_flux_box_monitors(
-            sim,
-            "pp_source_box",
-            [0.0, 0.0, G.eml_c[2] + z_shift],
-            source_box_size,
-        )
-
-    # Full-domain XZ field monitor so every dipole's emission can be saved as an |E|
-    # cross-section image (dipole_emission_N.png). The monitor plane is re-centered on
-    # each dipole's y so the slice passes through that dipole.
-    pp_field_images = env_flag("MSOPT_OLED_PP_FIELD_IMAGES", "1")
-    # Per-dipole Sr(theta,phi) radiation maps (Meep step2b style). Cheap (reuses the
-    # already-extracted spectrum), so on by default.
-    pp_radiation_images = env_flag("MSOPT_OLED_PP_RADIATION_IMAGES", "1")
-    pp_xz_monitor_name = "pp_xz_field"
-    if pp_field_images:
-        sim.add_monitor(pp_xz_monitor_name, [0.0, 0.0, 0.0], [post_sx, 0.0, post_sz])
-
-    angles = np.linspace(0.0, 90.0, env_int("MSOPT_OLED_POSTPROCESS_ANGLE_RES", 181))
-    signed_angles = signed_angle_axis(angles)
-    n_dipoles = env_int("MSOPT_OLED_POSTPROCESS_N_DIPOLES", 20)
-    pols = postprocess_polarizations()
-    if performance_spec is None:
-        target_pairs = sorted({0.0: 1.0, **{float(a): float(r) for a, r in G.target_angle_pairs}}.items())
-        performance_spec = make_ratio_performance_spec(
-            [a for a, _r in target_pairs],
-            [r for _a, r in target_pairs],
-            env_float("MSOPT_OLED_RATIO_TOL", 0.05),
-        )
-    else:
-        performance_spec = make_ratio_performance_spec(
-            performance_spec["angles_deg"],
-            performance_spec["target_ratios"],
-            performance_spec.get("tolerance", env_float("MSOPT_OLED_RATIO_TOL", 0.05)),
-        )
-    post_sources_by_pol = {
-        pol: central_cell_dipoles(G, n_dipoles, pol)
-        for pol in pols
-    }
-    source_box_min_clearance = None
-    if use_source_flux_box:
-        all_sources = [
-            point
-            for points in post_sources_by_pol.values()
-            for point in points
-        ]
-        source_box_min_clearance = minimum_source_box_clearance(
-            all_sources,
-            [0.0, 0.0, float(G.eml_c[2])],
-            source_box_size,
-        )
-        required_clearance = 0.25 / max(float(G.pp_resolution), 1.0)
-        if (
-            source_box_min_clearance is None
-            or source_box_min_clearance < required_clearance
-        ):
-            raise ValueError(
-                "Every postprocess dipole must be strictly inside the source flux "
-                "box. Current minimum clearance is "
-                f"{source_box_min_clearance!r} um; require >= "
-                f"{required_clearance:.6g} um. Reduce "
-                "MSOPT_OLED_PP_SOURCE_BOX_INSET_PIXELS or increase "
-                "MSOPT_OLED_PP_SOURCE_INSET_PIXELS."
-            )
-    requested_runs = int(sum(len(points) for points in post_sources_by_pol.values()))
-    failed_cases = []
-    records, spectrum_sum, per_dipole = [], None, []
-    pol_spectra = {}                                   # per-polarization incoherent sum
-    ukx = uky = None
-    run_idx = 0
-    keep_fsp = env_flag("MSOPT_OLED_PP_KEEP_FSP", "1")
-    angular_projection = os.environ.get(
-        "MSOPT_OLED_PP_ANGULAR_PROJECTION",
-        "farfield3d",
-    ).strip().lower()
-    if angular_projection not in ("farfield3d", "monitor_fft"):
-        raise ValueError(
-            "MSOPT_OLED_PP_ANGULAR_PROJECTION must be 'farfield3d' or 'monitor_fft'."
-        )
-
-    # Cache identity: the design, plus everything that changes what a single case
-    # computes. A cached spectrum is reused only when all of it matches, so a
-    # different design can never quietly inherit another one's cases.
-    pp_cache_key = "|".join(str(v) for v in (
-        hashlib.sha256(np.ascontiguousarray(rho, dtype=float).tobytes()).hexdigest()[:16],
-        G.resolution, angular_projection, float(np.mean(G.visible_wavelengths)),
-        G.target_monitor_c[2], G.Sx, G.Sy, G.Sz,
-    ))
-    manifest_path = os.path.join(G.design_dir, "OLED_postprocess_manifest.json")
-    design_hash = hashlib.sha256(np.ascontiguousarray(rho, dtype=np.float64).tobytes()).hexdigest()
-    manifest = {
-        "schema_version": 2,
-        "validation_protocol": {
-            "name": "step1_step2b_sourcewise_incoherent_v1",
-            "references": [
-                "step1_trace_comparison.py",
-                "step2b_coherence_case2abc_36src.py",
-            ],
-            "authoritative_estimator": "independent_sourcewise_incoherent_sum",
-            "coherent_random_phase_role": "trend_check_only",
-        },
-        "status": "running",
-        "authoritative": False,
-        "mode": pp_mode,
-        "convergence_confirmed": env_flag("MSOPT_OLED_PP_CONVERGENCE_CONFIRMED", "0"),
-        "tile_count": [int(tile_n), int(tile_n)],
-        "resolution": int(G.pp_resolution),
-        "monitor_boundary_inset_um": float(monitor_boundary_inset),
-        "monitor_span_um": [float(post_monitor_s[0]), float(post_monitor_s[1])],
-        "wavelength_um": [float(v) for v in np.asarray(G.visible_wavelengths).reshape(-1)],
-        "period_um": [float(G.window_x), float(G.window_y)],
-        "polarizations": list(pols),
-        "dipole_grid": int(env_int("MSOPT_OLED_PP_DIPOLE_GRID", 6)),
-        "source_layout": os.environ.get(
-            "MSOPT_OLED_PP_SOURCE_LAYOUT",
-            "validated_endpoint",
-        ),
-        "source_flux_box": bool(use_source_flux_box),
-        "source_flux_box_inset_um": (
-            float(source_box_inset) if source_box_inset is not None else None
-        ),
-        "source_flux_box_size_um": source_box_size,
-        "source_flux_box_min_source_clearance_um": source_box_min_clearance,
-        "angular_projection": angular_projection,
-        "requested_runs": requested_runs,
-        "successful_runs": 0,
-        "failed_runs": 0,
-        "completion_fraction": 0.0,
-        "design_sha256": design_hash,
-        # Planar runs characterize the unpatterned stack, so they are a
-        # REFERENCE, never an authoritative readout of a design.
-        "planar_baseline": bool(planar_baseline),
-        "capture": {"target_deg": float(capture_deg),
-                    "achieved_deg": float(achieved_deg),
-                    "monitor_above_stack_um": float(monitor_h),
-                    "lateral_um": float(post_sx)},
-        "performance_spec": {
-            key: (
-                [float(v) for v in np.asarray(value).reshape(-1)]
-                if isinstance(value, (np.ndarray, list, tuple))
-                else float(value)
-            )
-            for key, value in performance_spec.items()
-        },
-    }
-
-    def _write_manifest():
-        with open(manifest_path, "w", encoding="utf-8") as fp:
-            json.dump(manifest, fp, indent=2, sort_keys=True)
-            fp.write("\n")
-
-    def _write_records(path):
-        with open(path, "w", encoding="utf-8") as fp:
-            fp.write(f"status {manifest['status']}\n")
-            fp.write(f"requested_runs {requested_runs}\n")
-            fp.write(f"successful_runs {len(records)}\n")
-            fp.write(f"failed_runs {len(failed_cases)}\n")
-            fp.write(
-                "dipole_idx x_um y_um z_um pol top_monitor_transmission "
-                "source_power dipole_power source_box_power normalization_power "
-                "extracted_top_power LEE dipole_box_rel_diff\n"
-            )
-            for rec in records:
-                fp.write(
-                    "%d %.8e %.8e %.8e %s %.8e %.8e %.8e %.8e %.8e %.8e %.8e %.8e\n"
-                    % rec
-                )
-
-    _write_manifest()
-
-    def _drop_last_fsp():
-        # MSOPT_OLED_PP_KEEP_FSP=0: delete the just-analyzed run's .fsp so a long
-        # dipole/phase sweep does not fill the disk; results are already extracted.
-        # Lumerical writes a SIBLING DIRECTORY and a _p0.log next to every .fsp
-        # (~200 MB per run at postprocess sizes); removing only the .fsp still
-        # filled the disk and crashed later runs, so drop all three.
-        if keep_fsp:
-            return
-        fsp = getattr(sim, "_last_run_fsp_path", None)
-        if not fsp:
-            return
-        stem = fsp[:-4] if fsp.endswith(".fsp") else fsp
-        for path in (fsp, f"{stem}_p0.log"):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-        try:
-            if os.path.isdir(stem):
-                shutil.rmtree(stem, ignore_errors=True)
-        except Exception:
-            pass
-
-    def _case_spectrum():
-        # farfield3d on the top aperture is the Lumerical equivalent of the
-        # validated radial-Poynting N2F readout. A large supercell is required
-        # so high-angle power crosses this monitor before reaching lateral PML.
-        if angular_projection == "farfield3d":
-            return n2f_spectrum(sim, G.target_monitor_name)
-        T_c = read_transmission(sim.fdtd, G.target_monitor_name)
-        return monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T_c >= 0 else -1.0)
-
-    # A GPU shared with other jobs occasionally leaves a run with NO session
-    # results ("no d-card ... with the necessary data"); re-running just that
-    # dipole recovers it, so each dipole gets up to MSOPT_OLED_PP_RETRIES
-    # re-runs. Accumulators are only committed after EVERY session read
-    # succeeded, so a failed attempt can never double-count.
-    pp_retries = env_int("MSOPT_OLED_PP_RETRIES", 2)
-    for pol in pols:
-        post_sources = post_sources_by_pol[pol]
-        for i, (x, y, z, _p) in enumerate(post_sources):
-            print(f"[postprocess] {tile_n}x{tile_n}/PML pol={pol} dipole {i + 1}/{len(post_sources)}: x={x:.3f}, y={y:.3f}")
-            case_succeeded = False
-            # One flaky case at the end used to discard every other case's ANGULAR
-            # SPECTRUM, because the spectra only ever lived in memory -- 71 good runs
-            # thrown away for one failure. Each finished case is now written next to
-            # the run, so a re-run repeats only what is actually missing.
-            cached = load_pp_case(pp_cache_dir, pol, i, pp_cache_key)
-            last_error = None
-            for attempt in range(pp_retries + 1):
-                if cached is not None:
-                    (theta_i, spectrum_i, ukx_i, uky_i,
-                     T, src_power, dip_power, box_power) = cached
-                    if attempt == 0:
-                        print(f"[postprocess] cache hit pol={pol} dipole {i} -- FDTD skipped")
-                else:
-                    try:
-                        sim.fdtd.switchtolayout()
-                        delete_object(sim.fdtd, "postprocess_dipole")
-                        add_dipole(G, sim, x, y, z + z_shift, pol, "postprocess_dipole")
-                        if pp_field_images:
-                            sim.fdtd.setnamed(pp_xz_monitor_name, "y", y * 1e-6)
-                        sim.run(name=f"postprocess_pml_{run_idx:03d}", save=True)
-                        load_run_results(sim)
-                        T = read_transmission(sim.fdtd, G.target_monitor_name)
-                        if angular_projection == "farfield3d":
-                            theta_i, spectrum_i, ukx_i, uky_i = n2f_spectrum(sim, G.target_monitor_name)
-                        else:
-                            theta_i, spectrum_i, ukx_i, uky_i = monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T >= 0 else -1.0)
-                        freqs = source_freqs(G, sim)
-                        src_power = read_source_power(sim.fdtd, freqs)
-                        dip_power = read_dipole_power(sim.fdtd, freqs)
-                        box_power = (
-                            read_flux_box_power(sim.fdtd, source_flux_box_faces, src_power)
-                            if source_flux_box_faces
-                            else None
-                        )
-                    except Exception as exc:
-                        last_error = str(exc)
-                        if attempt < pp_retries:
-                            print(f"[postprocess] warning: pol={pol} dipole {i} attempt {attempt + 1} failed ({exc}); re-running")
-                            continue
-                        print(f"[postprocess] warning: pol={pol} dipole {i} failed after {pp_retries + 1} attempts: {exc}")
-                        break
-                # ---- all session reads done; commit (no fdtd calls below) ----
-                # Full LEE = extracted top power / validated source-box emission.
-                # is normalized to source power, so absolute top power = |T|*source_power;
-                # total emission = dipolepower (falls back to source power if unavailable).
-                src = valid_power(src_power)
-                dip = valid_power(dip_power)
-                box = valid_power(box_power)
-                total_emitted = box or dip or src or G.channel_power_floor
-                if use_source_flux_box and box is None:
-                    last_error = "source flux-box power is missing/non-positive"
-                    if attempt < pp_retries:
-                        print(
-                            f"[postprocess] warning: pol={pol} dipole {i} attempt "
-                            f"{attempt + 1} has no valid source-box power; re-running"
-                        )
-                        continue
-                    print(
-                        f"[postprocess] warning: pol={pol} dipole {i} failed after "
-                        f"{pp_retries + 1} attempts: {last_error}"
-                    )
-                    break
-                top_power_abs = max(float(T), 0.0) * (
-                    src if src is not None else total_emitted
-                )
-                # The floor is a divide-by-zero guard only. If it is anywhere
-                # near the real emitted power (~1e-15 W here) it silently
-                # REPLACES the denominator and every LEE is wrong, so refuse
-                # rather than publish a corrupted number.
-                if total_emitted <= 100.0 * G.channel_power_floor:
-                    raise RuntimeError(
-                        f"channel_power_floor ({G.channel_power_floor:.3e}) is not negligible "
-                        f"versus the emitted power ({total_emitted:.3e} W); it would replace the "
-                        "LEE denominator. Lower MSOPT_OLED_CHANNEL_POWER_FLOOR (it guards "
-                        "absolute watts, not FoM scores)."
-                    )
-                lee = top_power_abs / total_emitted
-                dipole_box_rel_diff = (
-                    abs(dip - box) / max(abs(dip), abs(box), G.channel_power_floor)
-                    if dip is not None and box is not None
-                    else np.nan
-                )
-                # Calibrate every angular spectrum to the independently measured
-                # absolute top-monitor power. This makes incoherent sums valid even
-                # when FFT/n2f normalization constants or source normalizations differ.
-                raw_spectrum_sum = float(np.sum(np.maximum(spectrum_i, 0.0)))
-                if not np.isfinite(raw_spectrum_sum) or raw_spectrum_sum <= 0.0:
-                    last_error = "zero/non-finite far-field power"
-                    if attempt < pp_retries:
-                        print(
-                            f"[postprocess] warning: pol={pol} dipole {i} attempt "
-                            f"{attempt + 1} produced zero/non-finite far-field power; re-running"
-                        )
-                        continue
-                    print(
-                        f"[postprocess] warning: pol={pol} dipole {i} failed after "
-                        f"{pp_retries + 1} attempts: zero/non-finite far-field power"
-                    )
-                    break
-                spectrum = np.maximum(spectrum_i, 0.0) * top_power_abs / raw_spectrum_sum
-                theta, ukx, uky = theta_i, ukx_i, uky_i
-                # Incoherent sum over BOTH position and polarization.
-                spectrum_sum = spectrum.copy() if spectrum_sum is None else spectrum_sum + spectrum
-                pol_spectra[pol] = spectrum.copy() if pol not in pol_spectra else pol_spectra[pol] + spectrum
-                records.append((
-                    run_idx, x, y, z, pol, float(T),
-                    src or np.nan, dip or np.nan, box or np.nan,
-                    total_emitted, top_power_abs, lee, dipole_box_rel_diff,
-                ))
-                case_succeeded = True
-                if cached is None:
-                    save_pp_case(pp_cache_dir, pol, i, pp_cache_key,
-                                 theta_i, spectrum_i, ukx_i, uky_i,
-                                 T, src_power, dip_power, box_power)
-                # Per-dipole angular breakdown: ring flux split into absolute extraction
-                # efficiency per angle bin (sums to this dipole's LEE), plus the
-                # per-direction radiance (solid-angle Jacobian removed) for the shape.
-                ring_flux = angle_profile(theta, spectrum, angles)
-                ring_count = angle_profile(theta, np.ones_like(spectrum), angles)
-                _, rad_signed = directional_radiance(theta, ukx, spectrum, signed_angles)
-                per_dipole.append({
-                    "idx": run_idx, "x": float(x), "y": float(y), "r": float(np.hypot(x, y)), "pol": pol, "lee": float(lee),
-                    "eff": ring_flux / max(total_emitted, G.channel_power_floor),
-                    "rad": ring_flux / np.maximum(ring_count, 1.0),
-                    "rad_signed": rad_signed,     # signed (+/-) radiance, real left/right shape
-                })
-                if pp_field_images:
-                    try:
-                        render_xz_field_image(
-                            sim.fdtd.getresult(pp_xz_monitor_name, "E"),
-                            os.path.join(G.design_dir, f"dipole_emission_{run_idx}.png"),
-                            f"dipole {run_idx}  pol={pol}  x={x:.2f} y={y:.2f} um  |E|",
-                        )
-                    except Exception as exc:
-                        print(f"[postprocess] warning: field image {run_idx} failed: {exc}")
-                if pp_radiation_images:
-                    try:
-                        th_ax, ph_ax, Sr_map = theta_phi_map(theta, ukx, uky, spectrum)
-                        save_radiation_map_figure(
-                            os.path.join(G.design_dir, f"dipole_radiation_{run_idx:03d}.png"),
-                            th_ax, ph_ax, Sr_map,
-                            f"dipole {run_idx}  pol={pol}  x={x:.2f} y={y:.2f} um",
-                        )
-                    except Exception as exc:
-                        print(f"[postprocess] warning: radiation map {run_idx} failed: {exc}")
-                _drop_last_fsp()
-                break
-            if not case_succeeded:
-                failed_cases.append({
-                    "dipole_idx": int(run_idx),
-                    "position_um": [float(x), float(y), float(z)],
-                    "polarization": pol,
-                    "error": last_error or "unknown postprocess failure",
-                })
-            manifest["successful_runs"] = len(records)
-            manifest["failed_runs"] = len(failed_cases)
-            manifest["completion_fraction"] = len(records) / max(requested_runs, 1)
-            manifest["failed_cases"] = failed_cases
-            _write_manifest()
-            run_idx += 1
-    sweep_seconds = time.time() - pp_t0
-    print(f"[postprocess] polarizations {pols}: {len(records)} total dipole runs (incoherent sum)")
-    print(f"[postprocess] dipole sweep wall time: {sweep_seconds / 60.0:.1f} min "
-          f"({sweep_seconds / max(run_idx, 1):.1f} s per simulation over {run_idx} runs)")
-
-    complete = len(records) == requested_runs
-    manifest["status"] = "complete" if complete else "incomplete"
-    manifest["successful_runs"] = len(records)
-    manifest["failed_runs"] = len(failed_cases)
-    manifest["completion_fraction"] = len(records) / max(requested_runs, 1)
-    manifest["failed_cases"] = failed_cases
-    _write_manifest()
-    _write_records(os.path.join(G.design_dir, "OLED_postprocess_records.txt"))
-    if not complete and env_flag("MSOPT_OLED_PP_REQUIRE_COMPLETE", "1"):
-        try:
-            sim.fdtd.close()
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"OLED postprocess incomplete: {len(records)}/{requested_runs} dipole/polarization "
-            f"cases succeeded. Aggregate performance was not published; rerun the failed cases."
-        )
-
-    # --- Coherence cases (validated step2b definitions) ------------------------
-    # Case 1: source-wise incoherent reference (the main loop above).
-    # Case 2a: all sources simultaneous, phase=0.
-    # Case 2b: one simultaneous random-phase draw, seed=0.
-    # Case 3: simultaneous random-phase draws, seed=1234, cumulative averages at
-    #         1/2/5/10/20 trials. Case 3 is a trend check, never a replacement
-    #         for the source-wise incoherent reference.
-    coh_cases = []                                   # (tag, theta, spectrum, ukx, uky)
-    rand_trial_profiles = []                         # (trial_no, theta, spectrum)
-    coherence_summary = {"enabled": False}
-    if env_flag("MSOPT_OLED_PP_COHERENT_CHECK", "0"):
-        pts = central_cell_dipoles(G, n_dipoles, pols[0])
+    def _run_coherent_case(tag, phases_deg):
         sim.fdtd.switchtolayout()
-        delete_object(sim.fdtd, "postprocess_dipole")
-        for k, (cx, cy, cz, cpol) in enumerate(pts):
-            add_dipole(G, sim, cx, cy, cz + z_shift, cpol, f"coherent_dipole_{k:03d}")
-        reference_records = [rec for rec in records if rec[4] == pols[0]]
-        reference_power = float(np.sum([rec[9] for rec in reference_records]))
-        reference_top = float(np.sum([rec[10] for rec in reference_records]))
-        reference_eta = reference_top / max(reference_power, G.channel_power_floor)
-
-        def _run_coherent_case(tag, phases_deg):
-            sim.fdtd.switchtolayout()
-            for source_idx, phase_deg in enumerate(phases_deg):
-                sim.fdtd.setnamed(
-                    f"coherent_dipole_{source_idx:03d}",
-                    "phase",
-                    float(phase_deg),
-                )
-            sim.run(name=f"postprocess_{tag}", save=True)
-            load_run_results(sim)
-            T_c = read_transmission(sim.fdtd, G.target_monitor_name)
-            freqs_c = source_freqs(G, sim)
-            src_c = valid_power(read_source_power(sim.fdtd, freqs_c))
-            box_c = read_flux_box_power(sim.fdtd, source_flux_box_faces, src_c)
-            if src_c is None or box_c is None:
-                raise RuntimeError("coherence case has no valid source/source-box power")
-            th_c, raw_c, ux_c, uy_c = _case_spectrum()
-            top_c = max(float(T_c), 0.0) * src_c
-            raw_sum_c = float(np.sum(np.maximum(raw_c, 0.0)))
-            if not np.isfinite(raw_sum_c) or raw_sum_c <= 0.0:
-                raise RuntimeError("coherence case has zero/non-finite far-field power")
-            spectrum_c = np.maximum(raw_c, 0.0) * top_c / raw_sum_c
-            eta_c = top_c / max(box_c, G.channel_power_floor)
-            _drop_last_fsp()
-            return {
-                "tag": tag,
-                "P_norm": float(box_c),
-                "P_up": float(top_c),
-                "eta_ff": float(eta_c),
-                "delta_eta_vs_incoherent": float(eta_c - reference_eta),
-                "rel_eta_error_vs_incoherent": float(
-                    abs(eta_c - reference_eta)
-                    / max(abs(reference_eta), G.channel_power_floor)
-                ),
-                "theta": th_c,
-                "spectrum": spectrum_c,
-                "ukx": ux_c,
-                "uky": uy_c,
-            }
-
-        coherence_summary = {
-            "enabled": True,
-            "source_layout": "validated 6x6 endpoint grid",
-            "polarization": pols[0],
-            "case1_incoherent": {
-                "P_norm_sum": reference_power,
-                "P_up_sum": reference_top,
-                "eta_ff": reference_eta,
-                "n_runs": len(reference_records),
-            },
-            "case3_checkpoints": [],
-            "failures": [],
+        for source_idx, phase_deg in enumerate(phases_deg):
+            sim.fdtd.setnamed(
+                f"coherent_dipole_{source_idx:03d}",
+                "phase",
+                float(phase_deg),
+            )
+        sim.run(name=f"postprocess_{tag}", save=True)
+        load_run_results(sim)
+        T_c = read_transmission(sim.fdtd, G.target_monitor_name)
+        freqs_c = source_freqs(G, sim)
+        src_c = valid_power(read_source_power(sim.fdtd, freqs_c))
+        box_c = read_flux_box_power(sim.fdtd, source_flux_box_faces, src_c)
+        if src_c is None or box_c is None:
+            raise RuntimeError("coherence case has no valid source/source-box power")
+        th_c, raw_c, ux_c, uy_c = _case_spectrum()
+        top_c = max(float(T_c), 0.0) * src_c
+        raw_sum_c = float(np.sum(np.maximum(raw_c, 0.0)))
+        if not np.isfinite(raw_sum_c) or raw_sum_c <= 0.0:
+            raise RuntimeError("coherence case has zero/non-finite far-field power")
+        spectrum_c = np.maximum(raw_c, 0.0) * top_c / raw_sum_c
+        eta_c = top_c / max(box_c, G.channel_power_floor)
+        _drop_last_fsp()
+        return {
+            "tag": tag,
+            "P_norm": float(box_c),
+            "P_up": float(top_c),
+            "eta_ff": float(eta_c),
+            "delta_eta_vs_incoherent": float(eta_c - reference_eta),
+            "rel_eta_error_vs_incoherent": float(
+                abs(eta_c - reference_eta)
+                / max(abs(reference_eta), G.channel_power_floor)
+            ),
+            "theta": th_c,
+            "spectrum": spectrum_c,
+            "ukx": ux_c,
+            "uky": uy_c,
         }
 
-        # Case 2a
-        try:
-            print(f"[postprocess] coherence case2a: {len(pts)} simultaneous dipoles, phase=0")
-            case2a = _run_coherent_case("case2a_same_phase", np.zeros(len(pts)))
-            coh_cases.append((
-                "case2a_same_phase",
-                case2a["theta"], case2a["spectrum"], case2a["ukx"], case2a["uky"],
-            ))
-            coherence_summary["case2a_same_phase"] = {
-                key: value for key, value in case2a.items()
-                if key not in ("theta", "spectrum", "ukx", "uky")
-            }
-        except Exception as exc:
-            coherence_summary["failures"].append({"case": "case2a", "error": str(exc)})
-            print(f"[postprocess] warning: coherence case2a failed: {exc}")
-
-        # Case 2b
-        try:
-            case2b_rng = np.random.default_rng(0)
-            case2b_phases = case2b_rng.uniform(0.0, 360.0, size=len(pts))
-            print("[postprocess] coherence case2b: one random-phase realization, seed=0")
-            case2b = _run_coherent_case("case2b_random_single", case2b_phases)
-            coh_cases.append((
-                "case2b_random_single",
-                case2b["theta"], case2b["spectrum"], case2b["ukx"], case2b["uky"],
-            ))
-            coherence_summary["case2b_random_single"] = {
-                key: value for key, value in case2b.items()
-                if key not in ("theta", "spectrum", "ukx", "uky")
-            }
-        except Exception as exc:
-            coherence_summary["failures"].append({"case": "case2b", "error": str(exc)})
-            print(f"[postprocess] warning: coherence case2b failed: {exc}")
-
-        # Case 3
-        n_rand_trials = env_int("MSOPT_OLED_PP_RANDOM_PHASE_TRIALS", 20)
-        rng_ph = np.random.default_rng(env_int("MSOPT_OLED_PP_RANDOM_PHASE_SEED", 1234))
-        all_ph = rng_ph.uniform(0.0, 360.0, size=(n_rand_trials, len(pts)))
-        np.savetxt(os.path.join(G.design_dir, "OLED_postprocess_randphase_phases_deg.txt"), all_ph)
-        sp_cum, norm_cum, top_cum, n_ok = None, 0.0, 0.0, 0
-        for t_no in range(1, n_rand_trials + 1):
-            try:
-                print(f"[postprocess] coherence case3 trial {t_no}/{n_rand_trials}")
-                case3_trial = _run_coherent_case(
-                    f"case3_trial_{t_no:03d}",
-                    all_ph[t_no - 1],
-                )
-            except Exception as exc:
-                coherence_summary["failures"].append({
-                    "case": f"case3_trial_{t_no:03d}",
-                    "error": str(exc),
-                })
-                print(f"[postprocess] warning: coherence case3 trial {t_no} failed: {exc}")
-                continue
-            n_ok += 1
-            norm_cum += case3_trial["P_norm"]
-            top_cum += case3_trial["P_up"]
-            rand_trial_profiles.append((
-                t_no,
-                case3_trial["theta"],
-                case3_trial["spectrum"],
-            ))
-            sp_cum = (
-                case3_trial["spectrum"].copy()
-                if sp_cum is None
-                else sp_cum + case3_trial["spectrum"]
-            )
-            if n_ok in (1, 2, 5, 10, 20) or t_no == n_rand_trials:
-                eta_avg = top_cum / max(norm_cum, G.channel_power_floor)
-                coherence_summary["case3_checkpoints"].append({
-                    "n_trials": n_ok,
-                    "P_norm_avg": norm_cum / n_ok,
-                    "P_up_avg": top_cum / n_ok,
-                    "eta_ff": eta_avg,
-                    "delta_eta_vs_incoherent": eta_avg - reference_eta,
-                    "rel_eta_error_vs_incoherent": (
-                        abs(eta_avg - reference_eta)
-                        / max(abs(reference_eta), G.channel_power_floor)
-                    ),
-                })
-                coh_cases.append((
-                    f"case3_avg{n_ok:03d}",
-                    case3_trial["theta"],
-                    sp_cum / n_ok,
-                    case3_trial["ukx"],
-                    case3_trial["uky"],
-                ))
-        manifest["coherence_validation"] = coherence_summary
-        with open(
-            os.path.join(G.design_dir, "OLED_postprocess_coherence_validation.json"),
-            "w",
-            encoding="utf-8",
-        ) as fp:
-            json.dump(coherence_summary, fp, indent=2, sort_keys=True)
-            fp.write("\n")
-        _write_manifest()
-
-    try:
-        sim.fdtd.close()
-    except Exception:
-        pass
-    if spectrum_sum is None:
-        print("[postprocess] skipped: no valid spectra")
-        return
-
-    # Per-direction radiance (solid-angle Jacobian removed). Both the |k|-binned (theta,
-    # symmetric) profile and the SIGNED profile (real +/- asymmetry) are kept; the polar
-    # figure uses the signed one so an asymmetric emission is no longer hidden by mirroring.
-    ring_flux = angle_profile(theta, spectrum_sum, angles)
-    radiance_norm = radiance_from_spectrum(theta, spectrum_sum, angles)
-    _, rad_signed_sum = directional_radiance(theta, ukx, spectrum_sum, signed_angles)
-    radiance_signed_norm = rad_signed_sum / max(float(np.max(rad_signed_sum)), 1e-30)
-    target = np.asarray([G.interp_curve(a) for a in angles], dtype=float)
-    target_norm = target / max(float(np.max(target)), 1e-30)
-
-    profile_data = np.column_stack([angles, ring_flux, radiance_norm, target_norm])
-    for profile_name in ("OLED_postprocess_angle_profile.txt", "OLED_postprocess_3x3_angle_profile.txt"):
-        np.savetxt(
-            os.path.join(G.design_dir, profile_name),
-            profile_data,
-            header="theta_deg ring_flux radiance_norm target_norm",
-        )
-
-    lee_values = np.asarray([rec[11] for rec in records], dtype=float)
-    lee_values = lee_values[np.isfinite(lee_values)]
-    valid_records = [
-        rec for rec in records
-        if np.isfinite(rec[10]) and np.isfinite(rec[9]) and rec[9] > 0.0
-    ]
-    emitted_power_sum = float(np.sum([rec[9] for rec in valid_records])) if valid_records else 0.0
-    mean_lee = (
-        float(np.sum([rec[10] for rec in valid_records]) / emitted_power_sum)
-        if emitted_power_sum > 0.0
-        else float("nan")
-    )
-    min_lee = float(np.min(lee_values)) if lee_values.size else float("nan")
-    max_lee = float(np.max(lee_values)) if lee_values.size else float("nan")
-    print(
-        f"[postprocess] full ensemble LEE (sum extracted top / sum normalization power): "
-        f"{mean_lee:.6e}; individual min={min_lee:.6e}, max={max_lee:.6e} "
-        f"over {lee_values.size} dipoles"
-    )
-    normalization_diffs = np.asarray([rec[12] for rec in records], dtype=float)
-    normalization_diffs = normalization_diffs[np.isfinite(normalization_diffs)]
-    normalization_tolerance = env_float("MSOPT_OLED_PP_POWER_NORM_TOL", 0.05)
-    normalization_check = {
-        "reference": "source_flux_box" if use_source_flux_box else "dipolepower",
-        "dipolepower_box_samples": int(normalization_diffs.size),
-        "dipolepower_box_median_rel_diff": (
-            float(np.median(normalization_diffs)) if normalization_diffs.size else None
-        ),
-        "dipolepower_box_max_rel_diff": (
-            float(np.max(normalization_diffs)) if normalization_diffs.size else None
-        ),
-        "comparison_tolerance": normalization_tolerance,
-        "comparison_pass": bool(
-            normalization_diffs.size == len(records)
-            and np.max(normalization_diffs) <= normalization_tolerance
-        ) if records else False,
+    coherence_summary = {
+        "enabled": True,
+        "source_layout": f"{pp_grid_n}x{pp_grid_n} "
+                         + os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT",
+                                          "cell_center").strip().lower()
+                         + " grid",
+        "polarization": pols[0],
+        "case1_incoherent": {
+            "P_norm_sum": reference_power,
+            "P_up_sum": reference_top,
+            "eta_ff": reference_eta,
+            "n_runs": len(reference_records),
+        },
+        "case3_checkpoints": [],
+        "failures": [],
     }
-    manifest["power_normalization"] = normalization_check
-    _write_manifest()
-    if normalization_diffs.size:
-        print(
-            "[postprocess] dipolepower vs source-box: "
-            f"median={np.median(normalization_diffs):.3%}, "
-            f"max={np.max(normalization_diffs):.3%}, "
-            f"check_pass={normalization_check['comparison_pass']} "
-            "(source box remains the normalization reference)"
-        )
 
-    # step2b-style ensemble products: theta-phi map, signed plane cuts, cone shares.
+    # Case 2a
+    try:
+        print(f"[postprocess] coherence case2a: {len(pts)} simultaneous dipoles, phase=0")
+        case2a = _run_coherent_case("case2a_same_phase", np.zeros(len(pts)))
+        coh_cases.append((
+            "case2a_same_phase",
+            case2a["theta"], case2a["spectrum"], case2a["ukx"], case2a["uky"],
+        ))
+        coherence_summary["case2a_same_phase"] = {
+            key: value for key, value in case2a.items()
+            if key not in ("theta", "spectrum", "ukx", "uky")
+        }
+    except Exception as exc:
+        coherence_summary["failures"].append({"case": "case2a", "error": str(exc)})
+        print(f"[postprocess] warning: coherence case2a failed: {exc}")
+
+    # Case 2b
+    try:
+        case2b_rng = np.random.default_rng(0)
+        case2b_phases = case2b_rng.uniform(0.0, 360.0, size=len(pts))
+        print("[postprocess] coherence case2b: one random-phase realization, seed=0")
+        case2b = _run_coherent_case("case2b_random_single", case2b_phases)
+        coh_cases.append((
+            "case2b_random_single",
+            case2b["theta"], case2b["spectrum"], case2b["ukx"], case2b["uky"],
+        ))
+        coherence_summary["case2b_random_single"] = {
+            key: value for key, value in case2b.items()
+            if key not in ("theta", "spectrum", "ukx", "uky")
+        }
+    except Exception as exc:
+        coherence_summary["failures"].append({"case": "case2b", "error": str(exc)})
+        print(f"[postprocess] warning: coherence case2b failed: {exc}")
+
+    # Case 3
+    n_rand_trials = env_int("MSOPT_OLED_PP_RANDOM_PHASE_TRIALS", 20)
+    rng_ph = np.random.default_rng(env_int("MSOPT_OLED_PP_RANDOM_PHASE_SEED", 1234))
+    all_ph = rng_ph.uniform(0.0, 360.0, size=(n_rand_trials, len(pts)))
+    np.savetxt(os.path.join(G.design_dir, "OLED_postprocess_randphase_phases_deg.txt"), all_ph)
+    sp_cum, norm_cum, top_cum, n_ok = None, 0.0, 0.0, 0
+    for t_no in range(1, n_rand_trials + 1):
+        try:
+            print(f"[postprocess] coherence case3 trial {t_no}/{n_rand_trials}")
+            case3_trial = _run_coherent_case(
+                f"case3_trial_{t_no:03d}",
+                all_ph[t_no - 1],
+            )
+        except Exception as exc:
+            coherence_summary["failures"].append({
+                "case": f"case3_trial_{t_no:03d}",
+                "error": str(exc),
+            })
+            print(f"[postprocess] warning: coherence case3 trial {t_no} failed: {exc}")
+            continue
+        n_ok += 1
+        norm_cum += case3_trial["P_norm"]
+        top_cum += case3_trial["P_up"]
+        rand_trial_profiles.append((
+            t_no,
+            case3_trial["theta"],
+            case3_trial["spectrum"],
+        ))
+        sp_cum = (
+            case3_trial["spectrum"].copy()
+            if sp_cum is None
+            else sp_cum + case3_trial["spectrum"]
+        )
+        if n_ok in (1, 2, 5, 10, 20) or t_no == n_rand_trials:
+            eta_avg = top_cum / max(norm_cum, G.channel_power_floor)
+            coherence_summary["case3_checkpoints"].append({
+                "n_trials": n_ok,
+                "P_norm_avg": norm_cum / n_ok,
+                "P_up_avg": top_cum / n_ok,
+                "eta_ff": eta_avg,
+                "delta_eta_vs_incoherent": eta_avg - reference_eta,
+                "rel_eta_error_vs_incoherent": (
+                    abs(eta_avg - reference_eta)
+                    / max(abs(reference_eta), G.channel_power_floor)
+                ),
+            })
+            coh_cases.append((
+                f"case3_avg{n_ok:03d}",
+                case3_trial["theta"],
+                sp_cum / n_ok,
+                case3_trial["ukx"],
+                case3_trial["uky"],
+            ))
+    manifest["coherence_validation"] = coherence_summary
+    with open(
+        os.path.join(G.design_dir, "OLED_postprocess_coherence_validation.json"),
+        "w",
+        encoding="utf-8",
+    ) as fp:
+        json.dump(coherence_summary, fp, indent=2, sort_keys=True)
+        fp.write("\n")
+    _write_manifest()
+
+
+def _postprocess_ensemble_products(
+        *, G,
+        angles,
+        angular_projection,
+        complete,
+        design_hash,
+        emitted_power_sum,
+        manifest,
+        mean_lee,
+        performance_spec,
+        planar_baseline,
+        pp_mode,
+        spectrum_sum,
+        theta,
+        ukx,
+        uky,
+        use_source_flux_box,
+        _write_manifest):
+    """The step2b ensemble products: theta-phi map, cone shares, cumulative
+    extraction, channel ratios, and the metrics they feed into the manifest.
+
+    Lifted out of run_postprocess to shorten it. The body is byte-identical and
+    every name it uses is passed in under its original name.
+
+    RETURNS the cumulative-extraction triple, which the caller needs for the
+    emission figure. Inline, that relied on `if "cum_ang" in dir()` -- a test
+    for whether the try block got far enough to bind the name. The idiom cannot
+    survive the move, because the names would no longer be in the scope of the
+    caller, and it degrades SILENTLY: render_emission_figure draws 2 panels
+    instead of 3 when cumulative is None, so the panel would vanish rather than
+    raise. Returning the triple, pre-seeded to None, keeps the behaviour and
+    makes the dependency visible.
+    """
+    cum_ang = cum_share = cum_abs = None
     try:
         th_ax, ph_ax, Sr_map = theta_phi_map(theta, ukx, uky, spectrum_sum)
         save_radiation_map_figure(
@@ -3759,6 +2882,770 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
         if env_flag("MSOPT_OLED_PP_REQUIRE_METRICS", "1"):
             raise RuntimeError(f"OLED postprocess angular metrics failed: {exc}") from exc
         print(f"[postprocess] warning: step2b-style products failed: {exc}")
+    return cum_ang, cum_share, cum_abs
+
+
+def run_postprocess(G, final_design, mapping=None, performance_spec=None):
+    pp_t0 = time.time()
+    # MSOPT_OLED_PP_PLANAR discards the design and characterizes an UNPATTERNED
+    # stack through the exact same pipeline, so its outputs are directly
+    # comparable folder-to-folder and give the reference every enhancement
+    # factor needs.  Two readings of "no design structure", both supported:
+    #   low  (= "1", default) : design region = low index (air) -- nothing at
+    #                           all on top of the stack
+    #   high                  : design region = high index -- a flat slab of the
+    #                           design material (isolates PATTERNING from the
+    #                           mere presence of the layer)
+    planar_mode, planar_baseline = planar_request()
+    if planar_baseline:
+        if planar_mode not in ("1", "true", "yes", "on", "low", "high"):
+            raise ValueError("MSOPT_OLED_PP_PLANAR must be 0, 1/low, or high.")
+        fill = 1.0 if planar_mode == "high" else 0.0
+        final_design = np.full(int(np.prod(G.design_grids)), fill, dtype=float)
+        mapping = None
+        which = "high index (flat slab of design material)" if fill else "low index (bare stack, nothing on top)"
+        print(f"[postprocess] PLANAR BASELINE: design discarded, design region = {which}")
+    # Case cache. Defaults to this run's own folder; MSOPT_OLED_PP_CACHE_DIR can point
+    # at a previous run's cache to finish a postprocess that died part-way.
+    pp_cache_dir = os.environ.get(
+        "MSOPT_OLED_PP_CACHE_DIR", os.path.join(G.design_dir, "pp_cache")).strip()
+    rho = design_to_grid(G, final_design, mapping)
+    if np.asarray(G.visible_wavelengths).size != 1:
+        raise ValueError(
+            "OLED postprocess currently requires one wavelength; transmission, "
+            "dipole power, and angular spectra must be accumulated per wavelength."
+        )
+
+    # Record WHICH structure these results belong to, before any simulation runs:
+    # the design usually comes from another run's lastdesign.txt, so the result
+    # folder would otherwise not contain the geometry it characterizes.
+    try:
+        save_final_structure(G, final_design, mapping)
+    except Exception as exc:
+        print(f"[postprocess] warning: could not save final structure: {exc}")
+
+    # --- Far-field geometry ----------------------------------------------------
+    # Two modes (MSOPT_OLED_PP_MODE):
+    #   single (alias "n2f"): SINGLE cell + PML; the angular
+    #        spectrum comes from the near-to-far projection of the top monitor,
+    #        so no tiling and no tall air gap are needed. Caveat: the periodic
+    #        array is truncated at the cell edge -- guided light reaching the
+    #        PML is absorbed instead of scattering at neighbour cells, so LEE
+    #        and order sharpness are approximations of the tiled reference.
+    #   supercell (alias "tile", the default): NxN tiling with the monitor
+    #        geometrically sized to capture pp_max_angle_deg from the central
+    #        cell (exact but expensive).
+    pp_mode = os.environ.get("MSOPT_OLED_PP_MODE", "supercell").strip().lower()
+    if pp_mode not in ("single", "n2f", "supercell", "tile"):
+        raise ValueError("MSOPT_OLED_PP_MODE must be 'single' (alias 'n2f') or 'supercell' (alias 'tile').")
+    pp_mode = {"n2f": "single", "tile": "supercell"}.get(pp_mode, pp_mode)
+    # Match the validated scripts: monitors are separated from the PML by the
+    # PML thickness plus a two-pixel gap, rather than sitting 0.15 um from the
+    # outer boundary where they may overlap the absorbing layer.
+    monitor_boundary_inset = env_float(
+        "MSOPT_OLED_PP_MONITOR_BOUNDARY_INSET_UM",
+        0.50 + 2.0 / max(float(G.pp_resolution), 1.0),
+    )
+    # Lateral size is set by the CAPTURE ANGLE, in both modes.
+    #
+    # near2far projects the field ON the monitor, so light that leaves through
+    # the lateral PML before reaching the monitor plane is simply absent from
+    # its input -- the projection cannot recover it. Measured directly: the same
+    # stack and the same farfield3d gave LEE 47.1 % at 2.72 um lateral and
+    # 58.3 % at 5.65 um. So the domain must be wide enough that
+    #     monitor half-width >= h * tan(capture) ,
+    # where h is measured from the LAST SOLID INTERFACE the light leaves -- the
+    # top of the stack, not the top of the design region. Using the design top
+    # under-counts h by the design thickness and silently narrows the capture
+    # (60 deg instead of the intended 69 deg in one run).
+    capture_deg = env_float("MSOPT_OLED_PP_CAPTURE_ANGLE_DEG", G.pp_max_angle_deg)
+    stack_top = max(l["center"][2] + 0.5 * l["size"][2] for l in G.stack_layers)
+
+    def _needed_half_width(monitor_z_, z_shift_):
+        h = max(monitor_z_ - (stack_top + z_shift_), 1e-6)
+        return h * float(np.tan(np.deg2rad(capture_deg))) + monitor_boundary_inset, h
+
+    if pp_mode == "single":
+        # n2f is a projection, so the monitor only has to clear the evanescent
+        # near field; keeping it LOW also keeps the escape cone narrow, which is
+        # what makes a modest domain sufficient.
+        pp_far = env_float("MSOPT_OLED_PP_N2F_FAR_Z_UM", 0.4)
+        post_sz = G.Sz + pp_far
+        z_shift = -0.5 * pp_far
+        monitor_z = 0.5 * post_sz - monitor_boundary_inset
+        tile_n = 1
+        half_needed, monitor_h = _needed_half_width(monitor_z, z_shift)
+        pad_env = os.environ.get("MSOPT_OLED_PP_N2F_PAD_UM")
+        pp_pad = (float(pad_env) if pad_env not in (None, "")
+                  else max(half_needed - 0.5 * G.Sx, 0.1))
+        post_sx, post_sy = G.Sx + 2.0 * pp_pad, G.Sy + 2.0 * pp_pad
+    else:
+        post_sz = G.Sz + G.pp_far_z_um
+        z_shift = -0.5 * G.pp_far_z_um              # keep the stack at the same height above the bottom
+        monitor_z = 0.5 * post_sz - monitor_boundary_inset
+        half_needed, monitor_h = _needed_half_width(monitor_z, z_shift)
+        tile_n = max(int(G.pp_min_tiles), int(np.ceil(2.0 * half_needed / G.Sx)))
+        if tile_n % 2 == 0:
+            tile_n += 1                              # odd -> there is a central cell
+        post_sx, post_sy = tile_n * G.Sx, tile_n * G.Sy
+
+    achieved_deg = float(np.degrees(np.arctan(
+        max(0.5 * post_sx - monitor_boundary_inset, 0.0) / max(monitor_h, 1e-9))))
+    print(f"[postprocess] capture: target {capture_deg:g} deg, monitor {monitor_h:.3f} um "
+          f"({monitor_h / float(np.mean(G.visible_wavelengths)):.2f} lambda) above the stack top, "
+          f"lateral {post_sx:g} um -> ACHIEVED {achieved_deg:.1f} deg")
+    if achieved_deg < capture_deg - 1.0:
+        print(f"[postprocess] WARNING: the domain only captures {achieved_deg:.1f} deg; "
+              "emission beyond that is absorbed by the lateral PML before it reaches "
+              "the monitor and is MISSING from the near2far input (LEE is a lower bound).")
+    post_monitor_s = [
+        post_sx - 2.0 * monitor_boundary_inset,
+        post_sy - 2.0 * monitor_boundary_inset,
+        0.0,
+    ]
+    if min(post_monitor_s[:2]) <= 0.0:
+        raise ValueError(
+            "Postprocess monitor span is non-positive; increase domain padding or "
+            "reduce MSOPT_OLED_PP_MONITOR_BOUNDARY_INSET_UM."
+        )
+    post_monitor_c = [0.0, 0.0, monitor_z]
+
+    cells = (post_sx * G.pp_resolution) * (post_sy * G.pp_resolution) * (post_sz * G.pp_resolution)
+    print(
+        f"[postprocess] mode={pp_mode}: {tile_n}x{tile_n} cell(s), domain "
+        f"{post_sx:g}x{post_sy:g}x{post_sz:g}um, monitor z={monitor_z:.2f}um, "
+        f"res={G.pp_resolution}, ~{cells/1e6:.0f}M cells"
+    )
+
+    sim = make_sim(G, [post_sx, post_sy, post_sz], bc_x="PML", bc_y="PML", res=G.pp_resolution)
+    add_stack(G, sim, span_x=post_sx, span_y=post_sy, z_offset=z_shift)
+    half = tile_n // 2
+    for ix in range(-half, half + 1):
+        for iy in range(-half, half + 1):
+            sim.add_design_grid(
+                f"design_{ix}_{iy}",
+                [ix * G.Sx, iy * G.Sy, G.design_c[2] + z_shift],
+                G.design_s,
+                G.design_high_index,
+                G.design_low_index,
+                G.design_grids,
+                rho,
+                float(np.mean(G.visible_wavelengths)),
+            )
+    sim.add_monitor(G.target_monitor_name, post_monitor_c, post_monitor_s)
+
+    # Validated step1/step2 normalization: total emitted power is the outward
+    # Poynting flux through a six-face box just inside the EML. dipolepower is
+    # retained as an independent cross-check, not silently treated as truth.
+    use_source_flux_box = env_flag("MSOPT_OLED_PP_SOURCE_FLUX_BOX", "1")
+    source_flux_box_faces = []
+    source_box_size = None
+    source_box_inset = None
+    if use_source_flux_box:
+        source_box_inset = (
+            # Meep tolerates a point source exactly on a flux-region face, but
+            # Lumerical does not: edge/corner sources then lose roughly 1/2 or
+            # 3/4 of their box-normalization power.  Keep the validated source
+            # grid at a two-pixel inset and place the box one pixel from the EML
+            # boundary so every source is strictly enclosed.
+            env_float("MSOPT_OLED_PP_SOURCE_BOX_INSET_PIXELS", 1.0)
+            / max(float(G.pp_resolution), 1.0)
+        )
+        source_box_size = [
+            G.active_x - 2.0 * source_box_inset,
+            G.active_y - 2.0 * source_box_inset,
+            G.eml_h - 2.0 * source_box_inset,
+        ]
+        source_flux_box_faces = add_flux_box_monitors(
+            sim,
+            "pp_source_box",
+            [0.0, 0.0, G.eml_c[2] + z_shift],
+            source_box_size,
+        )
+
+    # Full-domain XZ field monitor so every dipole's emission can be saved as an |E|
+    # cross-section image (dipole_emission_N.png). The monitor plane is re-centered on
+    # each dipole's y so the slice passes through that dipole.
+    pp_field_images = env_flag("MSOPT_OLED_PP_FIELD_IMAGES", "1")
+    # Per-dipole Sr(theta,phi) radiation maps (Meep step2b style). Cheap (reuses the
+    # already-extracted spectrum), so on by default.
+    pp_radiation_images = env_flag("MSOPT_OLED_PP_RADIATION_IMAGES", "1")
+    pp_xz_monitor_name = "pp_xz_field"
+    if pp_field_images:
+        sim.add_monitor(pp_xz_monitor_name, [0.0, 0.0, 0.0], [post_sx, 0.0, post_sz])
+
+    angles = np.linspace(0.0, 90.0, env_int("MSOPT_OLED_POSTPROCESS_ANGLE_RES", 181))
+    signed_angles = signed_angle_axis(angles)
+    n_dipoles = env_int("MSOPT_OLED_POSTPROCESS_N_DIPOLES", 20)
+    pols = postprocess_polarizations()
+    if performance_spec is None:
+        target_pairs = sorted({0.0: 1.0, **{float(a): float(r) for a, r in G.target_angle_pairs}}.items())
+        performance_spec = make_ratio_performance_spec(
+            [a for a, _r in target_pairs],
+            [r for _a, r in target_pairs],
+            env_float("MSOPT_OLED_RATIO_TOL", 0.05),
+        )
+    else:
+        performance_spec = make_ratio_performance_spec(
+            performance_spec["angles_deg"],
+            performance_spec["target_ratios"],
+            performance_spec.get("tolerance", env_float("MSOPT_OLED_RATIO_TOL", 0.05)),
+        )
+    # Resolved once, from the density grid, and threaded everywhere else -- the
+    # grid size and the fold decision are coupled (see resolve_dipole_grid), so
+    # re-reading the env var independently in each caller would let them disagree.
+    pp_grid_n, pp_fold_on, pp_asymmetry = resolve_dipole_grid(rho)
+    post_sources_by_pol = {
+        pol: central_cell_dipoles(G, n_dipoles, pol, grid_n=pp_grid_n)
+        for pol in pols
+    }
+    source_box_min_clearance = None
+    if use_source_flux_box:
+        all_sources = [
+            point
+            for points in post_sources_by_pol.values()
+            for point in points
+        ]
+        source_box_min_clearance = minimum_source_box_clearance(
+            all_sources,
+            [0.0, 0.0, float(G.eml_c[2])],
+            source_box_size,
+        )
+        required_clearance = 0.25 / max(float(G.pp_resolution), 1.0)
+        if (
+            source_box_min_clearance is None
+            or source_box_min_clearance < required_clearance
+        ):
+            raise ValueError(
+                "Every postprocess dipole must be strictly inside the source flux "
+                "box. Current minimum clearance is "
+                f"{source_box_min_clearance!r} um; require >= "
+                f"{required_clearance:.6g} um. Reduce "
+                "MSOPT_OLED_PP_SOURCE_BOX_INSET_PIXELS or increase "
+                "MSOPT_OLED_PP_SOURCE_INSET_PIXELS."
+            )
+    requested_runs = int(sum(len(points) for points in post_sources_by_pol.values()))
+    failed_cases = []
+    records, spectrum_sum, per_dipole = [], None, []
+    pol_spectra = {}                                   # per-polarization incoherent sum
+    ukx = uky = None
+    run_idx = 0
+    keep_fsp = env_flag("MSOPT_OLED_PP_KEEP_FSP", "1")
+    angular_projection = os.environ.get(
+        "MSOPT_OLED_PP_ANGULAR_PROJECTION",
+        "farfield3d",
+    ).strip().lower()
+    if angular_projection not in ("farfield3d", "monitor_fft"):
+        raise ValueError(
+            "MSOPT_OLED_PP_ANGULAR_PROJECTION must be 'farfield3d' or 'monitor_fft'."
+        )
+
+    # Cache identity: the design, plus everything that changes what a single case
+    # computes. A cached spectrum is reused only when all of it matches, so a
+    # different design can never quietly inherit another one's cases.
+    #
+    # THE GRID AND LAYOUT ARE PART OF THE IDENTITY. A case is addressed on disk by
+    # its flat grid INDEX (case_<pol>_<i>.npz) and nothing else, so two runs that
+    # agree on the design but not on the grid would map index i to two different
+    # dipole POSITIONS -- and the second would silently inherit the first's far
+    # field. That was only ever latent while every run used the 6x6 default; with
+    # the fold spending its saving on a 12x12 grid it is a live hazard, and a
+    # stale-cache mix-up is invisible in the output. Including them here demotes
+    # it to a cache miss.
+    pp_cache_key = "|".join(str(v) for v in (
+        hashlib.sha256(np.ascontiguousarray(rho, dtype=float).tobytes()).hexdigest()[:16],
+        G.resolution, angular_projection, float(np.mean(G.visible_wavelengths)),
+        G.target_monitor_c[2], G.Sx, G.Sy, G.Sz,
+        pp_grid_n,
+        os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT", "cell_center").strip().lower(),
+        env_float("MSOPT_OLED_PP_SOURCE_INSET_PIXELS", 2.0),
+    ))
+    manifest_path = os.path.join(G.design_dir, "OLED_postprocess_manifest.json")
+    design_hash = hashlib.sha256(np.ascontiguousarray(rho, dtype=np.float64).tobytes()).hexdigest()
+    manifest = {
+        "schema_version": 2,
+        "validation_protocol": {
+            "name": "step1_step2b_sourcewise_incoherent_v1",
+            "references": [
+                "step1_trace_comparison.py",
+                "step2b_coherence_case2abc_36src.py",
+            ],
+            "authoritative_estimator": "independent_sourcewise_incoherent_sum",
+            "coherent_random_phase_role": "trend_check_only",
+        },
+        "status": "running",
+        "authoritative": False,
+        "mode": pp_mode,
+        "convergence_confirmed": env_flag("MSOPT_OLED_PP_CONVERGENCE_CONFIRMED", "0"),
+        "tile_count": [int(tile_n), int(tile_n)],
+        "resolution": int(G.pp_resolution),
+        "monitor_boundary_inset_um": float(monitor_boundary_inset),
+        "monitor_span_um": [float(post_monitor_s[0]), float(post_monitor_s[1])],
+        "wavelength_um": [float(v) for v in np.asarray(G.visible_wavelengths).reshape(-1)],
+        "period_um": [float(G.window_x), float(G.window_y)],
+        "polarizations": list(pols),
+        "dipole_grid": int(pp_grid_n),
+        "symmetry_fold": bool(pp_fold_on),
+        "design_mirror_asymmetry": float(pp_asymmetry),
+        "source_layout": os.environ.get(
+            "MSOPT_OLED_PP_SOURCE_LAYOUT",
+            "cell_center",
+        ),
+        "source_flux_box": bool(use_source_flux_box),
+        "source_flux_box_inset_um": (
+            float(source_box_inset) if source_box_inset is not None else None
+        ),
+        "source_flux_box_size_um": source_box_size,
+        "source_flux_box_min_source_clearance_um": source_box_min_clearance,
+        "angular_projection": angular_projection,
+        "requested_runs": requested_runs,
+        "successful_runs": 0,
+        "failed_runs": 0,
+        "completion_fraction": 0.0,
+        "design_sha256": design_hash,
+        # Planar runs characterize the unpatterned stack, so they are a
+        # REFERENCE, never an authoritative readout of a design.
+        "planar_baseline": bool(planar_baseline),
+        "capture": {"target_deg": float(capture_deg),
+                    "achieved_deg": float(achieved_deg),
+                    "monitor_above_stack_um": float(monitor_h),
+                    "lateral_um": float(post_sx)},
+        "performance_spec": {
+            key: (
+                [float(v) for v in np.asarray(value).reshape(-1)]
+                if isinstance(value, (np.ndarray, list, tuple))
+                else float(value)
+            )
+            for key, value in performance_spec.items()
+        },
+    }
+
+    def _write_manifest():
+        with open(manifest_path, "w", encoding="utf-8") as fp:
+            json.dump(manifest, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+
+    def _write_records(path):
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(f"status {manifest['status']}\n")
+            fp.write(f"requested_runs {requested_runs}\n")
+            fp.write(f"successful_runs {len(records)}\n")
+            fp.write(f"failed_runs {len(failed_cases)}\n")
+            fp.write(
+                "dipole_idx x_um y_um z_um pol top_monitor_transmission "
+                "source_power dipole_power source_box_power normalization_power "
+                "extracted_top_power LEE dipole_box_rel_diff\n"
+            )
+            for rec in records:
+                fp.write(
+                    "%d %.8e %.8e %.8e %s %.8e %.8e %.8e %.8e %.8e %.8e %.8e %.8e\n"
+                    % rec
+                )
+
+    _write_manifest()
+
+    def _drop_last_fsp():
+        # MSOPT_OLED_PP_KEEP_FSP=0: delete the just-analyzed run's .fsp so a long
+        # dipole/phase sweep does not fill the disk; results are already extracted.
+        # Lumerical writes a SIBLING DIRECTORY and a _p0.log next to every .fsp
+        # (~200 MB per run at postprocess sizes); removing only the .fsp still
+        # filled the disk and crashed later runs, so drop all three.
+        if keep_fsp:
+            return
+        fsp = getattr(sim, "_last_run_fsp_path", None)
+        if not fsp:
+            return
+        stem = fsp[:-4] if fsp.endswith(".fsp") else fsp
+        for path in (fsp, f"{stem}_p0.log"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        try:
+            if os.path.isdir(stem):
+                shutil.rmtree(stem, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _case_spectrum():
+        # farfield3d on the top aperture is the Lumerical equivalent of the
+        # validated radial-Poynting N2F readout. A large supercell is required
+        # so high-angle power crosses this monitor before reaching lateral PML.
+        if angular_projection == "farfield3d":
+            return n2f_spectrum(sim, G.target_monitor_name)
+        T_c = read_transmission(sim.fdtd, G.target_monitor_name)
+        return monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T_c >= 0 else -1.0)
+
+    # A GPU shared with other jobs occasionally leaves a run with NO session
+    # results ("no d-card ... with the necessary data"); re-running just that
+    # dipole recovers it, so each dipole gets up to MSOPT_OLED_PP_RETRIES
+    # re-runs. Accumulators are only committed after EVERY session read
+    # succeeded, so a failed attempt can never double-count.
+    pp_retries = env_int("MSOPT_OLED_PP_RETRIES", 2)
+
+    # ---- C4v symmetry fold ---------------------------------------------------
+    # A mirror-symmetric design makes each dipole orbit ONE simulation instead of
+    # four: 36 runs of the 6x6 grid can only ever hold 9 distinct numbers, so the
+    # other 27 are paid for and discarded. Folding them away is NOT a coarser
+    # ensemble -- every orbit member still gets its own record, its own position
+    # and its own (reflected) far field, so the published LEE, angle profile and
+    # per-dipole plots are the same products over the same 36 emitters. Only the
+    # FDTD count changes.
+    #
+    # It is exact in the continuum and very nearly exact on the mesh: measured on
+    # run 20260812_035518, the four members of every orbit agreed to <= 6e-5
+    # relative, so replacing three of them by the fourth moves the ensemble by at
+    # most that. Summation order also changes, which is another ~1e-16. Neither
+    # is a modelling approximation, but "identical" means to those tolerances,
+    # not bitwise.
+    #
+    # OFF by default: it is exact for a C4v design and WRONG for anything else,
+    # so it is opted into, and even then refused unless the density grid actually
+    # carries both mirrors (see design_mirror_asymmetry -- the design flag lives
+    # in another file and can be stale, the grid cannot).
+    n_points = len(post_sources_by_pol[pols[0]])
+    fold_members = {i: [(i, False, False)] for i in range(n_points)}
+    if pp_fold_on:
+        if pp_grid_n * pp_grid_n != n_points:
+            raise ValueError("the symmetry fold requires the square "
+                             "MSOPT_OLED_PP_DIPOLE_GRID layout.")
+        orbits = mirror_orbits(pp_grid_n)
+        fold_members = {rep: members for rep, members in orbits}
+        print(f"[postprocess] symmetry fold ON (design mirror asymmetry {pp_asymmetry:.2e}): "
+              f"{pp_grid_n}x{pp_grid_n} grid, {len(orbits)} orbit(s) cover {n_points} point(s) "
+              f"-> {len(orbits)} FDTD run(s) per polarization instead of {n_points}")
+    else:
+        print(f"[postprocess] symmetry fold OFF (design mirror asymmetry "
+              f"{pp_asymmetry:.2e}): {pp_grid_n}x{pp_grid_n} grid, "
+              f"{n_points} FDTD run(s) per polarization")
+
+    for pol in pols:
+        post_sources = post_sources_by_pol[pol]
+        pol_base = pols.index(pol) * len(post_sources)
+        for i, (x, y, z, _p) in enumerate(post_sources):
+            if i not in fold_members:
+                continue          # mirror image of an orbit representative; see fold_members
+            print(f"[postprocess] {tile_n}x{tile_n}/PML pol={pol} dipole {i + 1}/{len(post_sources)}: x={x:.3f}, y={y:.3f}"
+                  + (f"  (+{len(fold_members[i]) - 1} mirror image(s))" if len(fold_members[i]) > 1 else ""))
+            case_succeeded = False
+            # One flaky case at the end used to discard every other case's ANGULAR
+            # SPECTRUM, because the spectra only ever lived in memory -- 71 good runs
+            # thrown away for one failure. Each finished case is now written next to
+            # the run, so a re-run repeats only what is actually missing.
+            cached = load_pp_case(pp_cache_dir, pol, i, pp_cache_key)
+            last_error = None
+            for attempt in range(pp_retries + 1):
+                if cached is not None:
+                    (theta_i, spectrum_i, ukx_i, uky_i,
+                     T, src_power, dip_power, box_power) = cached
+                    if attempt == 0:
+                        print(f"[postprocess] cache hit pol={pol} dipole {i} -- FDTD skipped")
+                else:
+                    try:
+                        sim.fdtd.switchtolayout()
+                        delete_object(sim.fdtd, "postprocess_dipole")
+                        add_dipole(G, sim, x, y, z + z_shift, pol, "postprocess_dipole")
+                        if pp_field_images:
+                            sim.fdtd.setnamed(pp_xz_monitor_name, "y", y * 1e-6)
+                        sim.run(name=f"postprocess_pml_{run_idx:03d}", save=True)
+                        load_run_results(sim)
+                        T = read_transmission(sim.fdtd, G.target_monitor_name)
+                        if angular_projection == "farfield3d":
+                            theta_i, spectrum_i, ukx_i, uky_i = n2f_spectrum(sim, G.target_monitor_name)
+                        else:
+                            theta_i, spectrum_i, ukx_i, uky_i = monitor_spectrum(sim, G.target_monitor_name, float(np.mean(G.visible_wavelengths)), 1.0 if T >= 0 else -1.0)
+                        freqs = source_freqs(G, sim)
+                        src_power = read_source_power(sim.fdtd, freqs)
+                        dip_power = read_dipole_power(sim.fdtd, freqs)
+                        box_power = (
+                            read_flux_box_power(sim.fdtd, source_flux_box_faces, src_power)
+                            if source_flux_box_faces
+                            else None
+                        )
+                    except Exception as exc:
+                        last_error = str(exc)
+                        if attempt < pp_retries:
+                            print(f"[postprocess] warning: pol={pol} dipole {i} attempt {attempt + 1} failed ({exc}); re-running")
+                            continue
+                        print(f"[postprocess] warning: pol={pol} dipole {i} failed after {pp_retries + 1} attempts: {exc}")
+                        break
+                # ---- all session reads done; commit (no fdtd calls below) ----
+                # Full LEE = extracted top power / validated source-box emission.
+                # is normalized to source power, so absolute top power = |T|*source_power;
+                # total emission = dipolepower (falls back to source power if unavailable).
+                src = valid_power(src_power)
+                dip = valid_power(dip_power)
+                box = valid_power(box_power)
+                total_emitted = box or dip or src or G.channel_power_floor
+                if use_source_flux_box and box is None:
+                    last_error = "source flux-box power is missing/non-positive"
+                    if attempt < pp_retries:
+                        print(
+                            f"[postprocess] warning: pol={pol} dipole {i} attempt "
+                            f"{attempt + 1} has no valid source-box power; re-running"
+                        )
+                        continue
+                    print(
+                        f"[postprocess] warning: pol={pol} dipole {i} failed after "
+                        f"{pp_retries + 1} attempts: {last_error}"
+                    )
+                    break
+                top_power_abs = max(float(T), 0.0) * (
+                    src if src is not None else total_emitted
+                )
+                # The floor is a divide-by-zero guard only. If it is anywhere
+                # near the real emitted power (~1e-15 W here) it silently
+                # REPLACES the denominator and every LEE is wrong, so refuse
+                # rather than publish a corrupted number.
+                if total_emitted <= 100.0 * G.channel_power_floor:
+                    raise RuntimeError(
+                        f"channel_power_floor ({G.channel_power_floor:.3e}) is not negligible "
+                        f"versus the emitted power ({total_emitted:.3e} W); it would replace the "
+                        "LEE denominator. Lower MSOPT_OLED_CHANNEL_POWER_FLOOR (it guards "
+                        "absolute watts, not FoM scores)."
+                    )
+                lee = top_power_abs / total_emitted
+                dipole_box_rel_diff = (
+                    abs(dip - box) / max(abs(dip), abs(box), G.channel_power_floor)
+                    if dip is not None and box is not None
+                    else np.nan
+                )
+                # Calibrate every angular spectrum to the independently measured
+                # absolute top-monitor power. This makes incoherent sums valid even
+                # when FFT/n2f normalization constants or source normalizations differ.
+                raw_spectrum_sum = float(np.sum(np.maximum(spectrum_i, 0.0)))
+                if not np.isfinite(raw_spectrum_sum) or raw_spectrum_sum <= 0.0:
+                    last_error = "zero/non-finite far-field power"
+                    if attempt < pp_retries:
+                        print(
+                            f"[postprocess] warning: pol={pol} dipole {i} attempt "
+                            f"{attempt + 1} produced zero/non-finite far-field power; re-running"
+                        )
+                        continue
+                    print(
+                        f"[postprocess] warning: pol={pol} dipole {i} failed after "
+                        f"{pp_retries + 1} attempts: zero/non-finite far-field power"
+                    )
+                    break
+                spectrum = np.maximum(spectrum_i, 0.0) * top_power_abs / raw_spectrum_sum
+                theta, ukx, uky = theta_i, ukx_i, uky_i
+                case_succeeded = True
+                if cached is None:
+                    save_pp_case(pp_cache_dir, pol, i, pp_cache_key,
+                                 theta_i, spectrum_i, ukx_i, uky_i,
+                                 T, src_power, dip_power, box_power)
+                # One pass per orbit member. Without the fold that is exactly this
+                # one case and the loop is what it always was; with it, the mirror
+                # images are reconstructed rather than simulated. Every scalar is
+                # mirror-invariant (same structure, same |E|^2), so only the far
+                # field has to be transformed: ukx runs along axis 0 and uky along
+                # axis 1, so x->-x is a flip of axis 0 and y->-y of axis 1. theta
+                # is invariant under both, which is why the theta-binned products
+                # below come out identical for every member -- but the 2-D
+                # spectrum_sum, the theta-phi map and the SIGNED radiance are not,
+                # and those are what the flips are for.
+                for m_i, flip_x, flip_y in fold_members[i]:
+                    m_spectrum = spectrum
+                    if flip_x:
+                        m_spectrum = np.flip(m_spectrum, axis=0)
+                    if flip_y:
+                        m_spectrum = np.flip(m_spectrum, axis=1)
+                    m_x, m_y, m_z, _mp = post_sources[m_i]
+                    m_idx = pol_base + m_i
+                    # Incoherent sum over BOTH position and polarization.
+                    spectrum_sum = m_spectrum.copy() if spectrum_sum is None else spectrum_sum + m_spectrum
+                    pol_spectra[pol] = (m_spectrum.copy() if pol not in pol_spectra
+                                        else pol_spectra[pol] + m_spectrum)
+                    records.append((
+                        m_idx, m_x, m_y, m_z, pol, float(T),
+                        src or np.nan, dip or np.nan, box or np.nan,
+                        total_emitted, top_power_abs, lee, dipole_box_rel_diff,
+                    ))
+                    # Per-dipole angular breakdown: ring flux split into absolute extraction
+                    # efficiency per angle bin (sums to this dipole's LEE), plus the
+                    # per-direction radiance (solid-angle Jacobian removed) for the shape.
+                    ring_flux = angle_profile(theta, m_spectrum, angles)
+                    ring_count = angle_profile(theta, np.ones_like(m_spectrum), angles)
+                    _, rad_signed = directional_radiance(theta, ukx, m_spectrum, signed_angles)
+                    per_dipole.append({
+                        "idx": m_idx, "x": float(m_x), "y": float(m_y),
+                        "r": float(np.hypot(m_x, m_y)), "pol": pol, "lee": float(lee),
+                        "eff": ring_flux / max(total_emitted, G.channel_power_floor),
+                        "rad": ring_flux / np.maximum(ring_count, 1.0),
+                        "rad_signed": rad_signed,     # signed (+/-) radiance, real left/right shape
+                    })
+                if pp_field_images:
+                    try:
+                        render_xz_field_image(
+                            sim.fdtd.getresult(pp_xz_monitor_name, "E"),
+                            os.path.join(G.design_dir, f"dipole_emission_{run_idx}.png"),
+                            f"dipole {run_idx}  pol={pol}  x={x:.2f} y={y:.2f} um  |E|",
+                        )
+                    except Exception as exc:
+                        print(f"[postprocess] warning: field image {run_idx} failed: {exc}")
+                if pp_radiation_images:
+                    try:
+                        th_ax, ph_ax, Sr_map = theta_phi_map(theta, ukx, uky, spectrum)
+                        save_radiation_map_figure(
+                            os.path.join(G.design_dir, f"dipole_radiation_{run_idx:03d}.png"),
+                            th_ax, ph_ax, Sr_map,
+                            f"dipole {run_idx}  pol={pol}  x={x:.2f} y={y:.2f} um",
+                        )
+                    except Exception as exc:
+                        print(f"[postprocess] warning: radiation map {run_idx} failed: {exc}")
+                _drop_last_fsp()
+                break
+            if not case_succeeded:
+                failed_cases.append({
+                    "dipole_idx": int(run_idx),
+                    "position_um": [float(x), float(y), float(z)],
+                    "polarization": pol,
+                    "error": last_error or "unknown postprocess failure",
+                })
+            manifest["successful_runs"] = len(records)
+            manifest["failed_runs"] = len(failed_cases)
+            manifest["completion_fraction"] = len(records) / max(requested_runs, 1)
+            manifest["failed_cases"] = failed_cases
+            _write_manifest()
+            run_idx += 1
+    sweep_seconds = time.time() - pp_t0
+    print(f"[postprocess] polarizations {pols}: {len(records)} total dipole runs (incoherent sum)")
+    print(f"[postprocess] dipole sweep wall time: {sweep_seconds / 60.0:.1f} min "
+          f"({sweep_seconds / max(run_idx, 1):.1f} s per simulation over {run_idx} runs)")
+
+    complete = len(records) == requested_runs
+    manifest["status"] = "complete" if complete else "incomplete"
+    manifest["successful_runs"] = len(records)
+    manifest["failed_runs"] = len(failed_cases)
+    manifest["completion_fraction"] = len(records) / max(requested_runs, 1)
+    manifest["failed_cases"] = failed_cases
+    _write_manifest()
+    _write_records(os.path.join(G.design_dir, "OLED_postprocess_records.txt"))
+    if not complete and env_flag("MSOPT_OLED_PP_REQUIRE_COMPLETE", "1"):
+        try:
+            sim.fdtd.close()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"OLED postprocess incomplete: {len(records)}/{requested_runs} dipole/polarization "
+            f"cases succeeded. Aggregate performance was not published; rerun the failed cases."
+        )
+
+    # --- Coherence cases (validated step2b definitions) ------------------------
+    # Case 1: source-wise incoherent reference (the main loop above).
+    # Case 2a: all sources simultaneous, phase=0.
+    # Case 2b: one simultaneous random-phase draw, seed=0.
+    # Case 3: simultaneous random-phase draws, seed=1234, cumulative averages at
+    #         1/2/5/10/20 trials. Case 3 is a trend check, never a replacement
+    #         for the source-wise incoherent reference.
+    coh_cases = []                                   # (tag, theta, spectrum, ukx, uky)
+    rand_trial_profiles = []                         # (trial_no, theta, spectrum)
+    coherence_summary = {"enabled": False}
+    # Optional coherence audit (step2b cases 2a/2b/3). Body in
+    # _postprocess_coherence_audit; it is off by default and self-contained.
+    if env_flag("MSOPT_OLED_PP_COHERENT_CHECK", "0"):
+        _postprocess_coherence_audit(
+            G=G, sim=sim, manifest=manifest, records=records, pols=pols,
+            n_dipoles=n_dipoles, pp_grid_n=pp_grid_n, z_shift=z_shift,
+            source_flux_box_faces=source_flux_box_faces,
+            coh_cases=coh_cases, rand_trial_profiles=rand_trial_profiles,
+            _case_spectrum=_case_spectrum, _drop_last_fsp=_drop_last_fsp,
+            _write_manifest=_write_manifest)
+
+    try:
+        sim.fdtd.close()
+    except Exception:
+        pass
+    if spectrum_sum is None:
+        print("[postprocess] skipped: no valid spectra")
+        return
+
+    # Per-direction radiance (solid-angle Jacobian removed). Both the |k|-binned (theta,
+    # symmetric) profile and the SIGNED profile (real +/- asymmetry) are kept; the polar
+    # figure uses the signed one so an asymmetric emission is no longer hidden by mirroring.
+    ring_flux = angle_profile(theta, spectrum_sum, angles)
+    radiance_norm = radiance_from_spectrum(theta, spectrum_sum, angles)
+    _, rad_signed_sum = directional_radiance(theta, ukx, spectrum_sum, signed_angles)
+    radiance_signed_norm = rad_signed_sum / max(float(np.max(rad_signed_sum)), 1e-30)
+    target = np.asarray([G.interp_curve(a) for a in angles], dtype=float)
+    target_norm = target / max(float(np.max(target)), 1e-30)
+
+    profile_data = np.column_stack([angles, ring_flux, radiance_norm, target_norm])
+    for profile_name in ("OLED_postprocess_angle_profile.txt", "OLED_postprocess_3x3_angle_profile.txt"):
+        np.savetxt(
+            os.path.join(G.design_dir, profile_name),
+            profile_data,
+            header="theta_deg ring_flux radiance_norm target_norm",
+        )
+
+    lee_values = np.asarray([rec[11] for rec in records], dtype=float)
+    lee_values = lee_values[np.isfinite(lee_values)]
+    valid_records = [
+        rec for rec in records
+        if np.isfinite(rec[10]) and np.isfinite(rec[9]) and rec[9] > 0.0
+    ]
+    emitted_power_sum = float(np.sum([rec[9] for rec in valid_records])) if valid_records else 0.0
+    # ABSOLUTE per-direction radiance: per unit EMITTED power, so it is comparable
+    # BETWEEN devices and independent of how many dipoles were summed.
+    # radiance_signed_norm above is divided by its OWN peak, which throws exactly
+    # that away -- fine for drawing one device's shape, useless for saying whether
+    # this device is brighter or dimmer than another. The planar overlay needs the
+    # absolute one; see render_pp_summary_figure.
+    radiance_signed_abs = rad_signed_sum / max(emitted_power_sum, G.channel_power_floor)
+    mean_lee = (
+        float(np.sum([rec[10] for rec in valid_records]) / emitted_power_sum)
+        if emitted_power_sum > 0.0
+        else float("nan")
+    )
+    min_lee = float(np.min(lee_values)) if lee_values.size else float("nan")
+    max_lee = float(np.max(lee_values)) if lee_values.size else float("nan")
+    print(
+        f"[postprocess] full ensemble LEE (sum extracted top / sum normalization power): "
+        f"{mean_lee:.6e}; individual min={min_lee:.6e}, max={max_lee:.6e} "
+        f"over {lee_values.size} dipoles"
+    )
+    normalization_diffs = np.asarray([rec[12] for rec in records], dtype=float)
+    normalization_diffs = normalization_diffs[np.isfinite(normalization_diffs)]
+    normalization_tolerance = env_float("MSOPT_OLED_PP_POWER_NORM_TOL", 0.05)
+    normalization_check = {
+        "reference": "source_flux_box" if use_source_flux_box else "dipolepower",
+        "dipolepower_box_samples": int(normalization_diffs.size),
+        "dipolepower_box_median_rel_diff": (
+            float(np.median(normalization_diffs)) if normalization_diffs.size else None
+        ),
+        "dipolepower_box_max_rel_diff": (
+            float(np.max(normalization_diffs)) if normalization_diffs.size else None
+        ),
+        "comparison_tolerance": normalization_tolerance,
+        "comparison_pass": bool(
+            normalization_diffs.size == len(records)
+            and np.max(normalization_diffs) <= normalization_tolerance
+        ) if records else False,
+    }
+    manifest["power_normalization"] = normalization_check
+    _write_manifest()
+    if normalization_diffs.size:
+        print(
+            "[postprocess] dipolepower vs source-box: "
+            f"median={np.median(normalization_diffs):.3%}, "
+            f"max={np.max(normalization_diffs):.3%}, "
+            f"check_pass={normalization_check['comparison_pass']} "
+            "(source box remains the normalization reference)"
+        )
+
+    # step2b-style ensemble products: theta-phi map, signed plane cuts, cone shares.
+    # step2b ensemble products (theta-phi map, cone shares, cumulative
+    # extraction, channel ratios). Body in _postprocess_ensemble_products.
+    cum_ang, cum_share, cum_abs = _postprocess_ensemble_products(
+        G=G, angles=angles, angular_projection=angular_projection,
+        complete=complete, design_hash=design_hash,
+        emitted_power_sum=emitted_power_sum, manifest=manifest,
+        mean_lee=mean_lee, performance_spec=performance_spec,
+        planar_baseline=planar_baseline, pp_mode=pp_mode,
+        spectrum_sum=spectrum_sum, theta=theta, ukx=ukx, uky=uky,
+        use_source_flux_box=use_source_flux_box,
+        _write_manifest=_write_manifest)
 
     # Per-polarization breakdown (only when the sweep ran more than one polarization):
     # each polarization's own incoherent angular profile and ensemble LEE, so x vs y (vs z)
@@ -3914,15 +3801,35 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
                   f"-> {mean_lee / planar_lee:.2f}x")
 
     path = os.path.join(G.design_dir, "OLED_postprocess_emission.png")
-    cum_for_fig = (cum_ang, cum_share, cum_abs) if "cum_ang" in dir() else None
+    cum_for_fig = ((cum_ang, cum_share, cum_abs)
+                   if cum_ang is not None else None)
     render_emission_figure(angles, radiance_signed_norm, target_norm, order_thetas, achieved_share, target_share, path, "signed radiance", lee=mean_lee, planar_lee=planar_lee, cumulative=cum_for_fig)
     legacy_path = os.path.join(G.design_dir, "OLED_postprocess_3x3_emission.png")
     render_emission_figure(angles, radiance_signed_norm, target_norm, order_thetas, achieved_share, target_share, legacy_path, "signed radiance", lee=mean_lee, planar_lee=planar_lee, cumulative=cum_for_fig)
     print(f"[postprocess] saved emission (radiance + order-share) plot: {path}")
 
+    # A planar run is the ONE that produces the reference every other run draws;
+    # write it before the figure so this run's own plot already shows it.
+    #
+    # Refresh whenever the stored curve is not USABLE, not merely when the file is
+    # absent. The old "and not os.path.exists(...)" meant the very first planar
+    # measurement was permanent: a later planar run -- deliberately launched to
+    # replace a reference from a different stack, grid or storage format -- would
+    # silently decline to write, and the stale curve stayed. Someone running a
+    # planar postprocess is asking for exactly this file.
+    if planar_requested():
+        _identity = planar_reference_identity(G, pp_grid_n)
+        if load_planar_reference_curve(identity=_identity)[0] is None:
+            save_planar_reference_curve(angles, radiance_signed_abs, lee=mean_lee,
+                                        identity=_identity)
+        else:
+            print("[postprocess] planar reference already matches this configuration; kept")
+
     summary_path = os.path.join(G.design_dir, "PP_summary.png")
     render_pp_summary_figure(angles, radiance_signed_norm, target_norm,
-                             summary_path, lee=mean_lee, planar_lee=planar_lee)
+                             summary_path, lee=mean_lee, planar_lee=planar_lee,
+                             planar_identity=planar_reference_identity(G, pp_grid_n),
+                             radiance_signed_abs=radiance_signed_abs)
     print(f"[postprocess] saved PP summary (radiance polar + vs theta): {summary_path}")
 
     per_path = save_per_dipole_emission_plot(G, angles, per_dipole, os.path.join(G.design_dir, "OLED_postprocess_per_dipole_emission.png"))

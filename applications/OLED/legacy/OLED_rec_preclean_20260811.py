@@ -25,8 +25,7 @@ EML dipole radiating outward through that order, which is what the incoherent
 postprocess ends up measuring.
 
 FoM
-    J = level_score(T*S) * match(p)                  <- MERGE_LEVEL_INTO_MATCH
-    J = _ST * level_score(T*S) + _SM * match(p)      <- the older split form
+    J = _ST * level_score(T*S)  +  _SM * match(p)
 
     p_i = |<E_EML , exp(-i k_i . r)>|^2 / |E_EML|^2, one per target (angle,
     order) pair -- the normalized modal purity, what fraction of the EML
@@ -40,29 +39,20 @@ FoM
     purities (this script's original design, and OLED_opt's/OLED_new's)
     cannot punish "everything in one order" the way a product-based score can.
 
-    The two are combined by a PRODUCT, not a sum, and they are not
-    interchangeable halves: match is deliberately SCALE-INVARIANT (it divides
-    by S), so nothing in it pulls S up, and as a SEPARATE objective the level
-    term was skipped by minimax on essentially every iteration for sitting
-    above the mean -- leaving S free to collapse while the shape score stayed
-    happy. Multiplying GATES the shape score by the level, so a
-    perfectly-shaped but vanishing allocation scores ~0. See
-    MERGE_LEVEL_INTO_MATCH and merged_J for the measurement that forced this.
-
 Gradient
-    ONE top-level objective (two with suppression on), not one per target
-    mode: merged_J covers the level and every target (angle, order) pair at
-    once. msopt's Incoherent=True (PER_MODE_ADJOINT) still runs one forward +
-    one adjoint PER OBJECTIVE FUNCTION, restoring the cached forward field
-    between them -- "per objective" just no longer means "per mode": match_J's
-    joint KL-divergence form is NOT separable across modes the way a weighted
-    sum is (see its own docstring), so it is traced by autograd as a single
-    objective instead of being split into one adjoint per mode. That single
-    joint adjoint gives the mathematically EXACT gradient of the whole
-    product, not an approximation -- no per-mode decomposition trick is needed
-    the way RATIO_WINDOW (an earlier, now-removed attempt at the same
-    underlying problem; see match_J and the oled-outcoupling-optimization
-    memory) required one.
+    Two top-level objectives, not one per target mode: transmission_J (the
+    level term) and match_J (ONE joint distribution-match term covering every
+    target (angle, order) pair at once). msopt's Incoherent=True
+    (PER_MODE_ADJOINT) still runs one forward + one adjoint PER OBJECTIVE
+    FUNCTION, restoring the cached forward field between them -- "per
+    objective" just no longer means "per mode": match_J's joint KL-divergence
+    form is NOT separable across modes the way a weighted sum is (see its own
+    docstring), so it is traced by autograd as a single objective instead of
+    being split into one adjoint per mode. That single joint adjoint gives the
+    mathematically EXACT gradient of match(p), not an approximation -- no
+    per-mode decomposition trick is needed the way RATIO_WINDOW (an earlier,
+    now-removed attempt at the same underlying problem; see match_J and the
+    oled-outcoupling-optimization memory) required one.
 
 Relation to the other optimizers
     OLED_opt probes at each target angle separately (N forward runs) and scores
@@ -113,15 +103,7 @@ import k_mapping as km
 RUN_OPTIMIZATION = True
 PLANAR_PP = False
 PP_MODE = "supercell"
-PP_DIPOLE_GRID = None          # None -> let oled_common.resolve_dipole_grid decide
-                               # (12x12 folded for a mirror-symmetric design, 6x6
-                               # otherwise -- 36 FDTD runs either way).
-                               # MUST stay None rather than a number: this value is
-                               # pushed into MSOPT_OLED_PP_DIPOLE_GRID by
-                               # export_run_knobs below, and env_int cannot tell an
-                               # env var the SCRIPT exported from one the USER set,
-                               # so any number here silently overrides the default
-                               # for every run. Set the env var to override.
+PP_DIPOLE_GRID = 6
 PP_CAPTURE_DEG = 60
 PP_KEEP_FSP = False
 RESOLUTION = 50
@@ -184,12 +166,10 @@ TARGET_MAX_ANGLE = 45.0        # ladder: the outermost emission angle, in air
 N_ORDERS = 3                   # ladder: rungs / top order M. P = M*lam/sin(TARGET_MAX_ANGLE)
 AZIMUTHS_DEG = [0.0, 90.0]
 RAMP = "linear"                # "linear" interpolates W_AT_0 -> W_AT_MAX, "flat" equal
-W_AT_0 = oc.env_float("MSOPT_OLED_W_AT_0", 1.00)     # requested share at normal incidence
-W_AT_MAX = oc.env_float("MSOPT_OLED_W_AT_MAX", 0.9)  # requested share at TARGET_MAX_ANGLE;
-                               # rungs between are interpolated, giving a profile
-                               # that peaks on axis and falls off gently.
-                               # env-overridable so a ramp sweep (e.g. 0.9 vs 0.8 at
-                               # the top angle) launches without editing the file.
+W_AT_0 = 1.00                  # requested share at normal incidence
+W_AT_MAX = 0.9                 # requested share at TARGET_MAX_ANGLE; rungs between
+                               # are interpolated, giving a profile that peaks on
+                               # axis and falls off gently.
 RAMP_AXIS = "theta"            # interpolate linearly in "theta" or in "u"=sin(theta)
 
 # How a per-mode purity becomes one score. Only the SUPPRESS term still uses this
@@ -213,16 +193,13 @@ LOG_EPS = 1e-3                 # floor inside both scores: guards log at p=0 and
 # What the per-mode terms measure.
 #   "purity"   p_i = overlap / TOTAL EML intensity, a share in [0, 1]: SHAPE only.
 #              match_J divides by sum_i(p_i) anyway, so any common scale cancels.
-#
-# An "absolute" variant, a_i = overlap / (N * planar reference) = p_i * T, used to
-# be selectable and is REMOVED. It could not pay for itself: match_J divides by
-# sum(p) anyway, so the SHAPE score was identical either way, while
-# transmission_term already multiplies by T -- absolute fed T into the level term
-# a second time (T ~ 3.4 in this microcavity, not a rounding error). It also
-# rescaled the raw suppressed sum that LEAK_TOL thresholds, so the same tolerance
-# bit ~T times harder and no run could separate "metric" from "suppression
-# strength". Nothing measurable was left once both defects were accounted for.
-_MLAB = "p"
+#   "absolute" a_i = overlap / (N * planar reference) = p_i * T: level and shape in
+#              one number. NOTE transmission_term already multiplies by T, so with
+#              "absolute" that factor enters the level score twice.
+MODAL_METRIC = oc.env_str("MSOPT_OLED_MODAL_METRIC", "purity")   # env override:
+                               # "purity" (share of the plane) or "absolute"
+                               # (purity x level). Swept by the factor study.
+_MLAB = "a" if MODAL_METRIC == "absolute" else "p"
 
 MULTIOBJ = oc.env_str("MSOPT_OLED_MULTIOBJ", "minimax")   # "minimax" | "weighted"
 # HOW THE OBJECTIVES COMBINE.
@@ -240,42 +217,7 @@ MULTIOBJ = oc.env_str("MSOPT_OLED_MULTIOBJ", "minimax")   # "minimax" | "weighte
 #               This is the answer to "what T:P ratio is right": none, if the
 #               level term is written as a CONSTRAINT that saturates (see
 #               level_score/LEVEL_KNEE) rather than a quantity to maximize.
-
-# ---- Level and match: ONE objective (a product), not two ----------------------
-MERGE_LEVEL_INTO_MATCH = oc.env_flag("MSOPT_OLED_MERGE_LEVEL", "1")
-# ON  J_merged = level_score(T*S) * match(p)          -- one objective, one adjoint
-# OFF J1 = _ST*level_score(T*S), J2 = _SM*match(p)    -- the older split form
-#
-# WHY THE SPLIT FORM FAILS. match_J divides by sum(p), so it is SCALE-INVARIANT:
-# it scores the RATIO among the captured orders and is indifferent to how much was
-# captured at all. The only term that sees the captured share S is the level term,
-# and under minimax that term is skipped on every iteration it sits above the mean
-# of the three -- which, with the knee at the planar level (LEVEL_KNEE_SCORE=0.9),
-# is essentially always. So nothing pushes S up. Measured live on run 1_diag at
-# eval 107: sum(p) = 0.168 over 7 cones against 0.562 over 4 cones for 2_nodiag,
-# with level = 0.870 -> T*S = 0.743, i.e. T ~ 4.4. Field piles up in the cavity
-# instead of in the target momenta -- the old "buy score by raising T" failure
-# reappearing in a new place.
-#
-# WHY A PRODUCT, and specifically NOT the removed "absolute" metric: feeding p_i*T
-# into the modal terms gets divided straight back out by match_J's own normalizer,
-# which is why absolute measured nothing (see _MLAB above). Multiplying the
-# FINISHED match by the FINISHED level score cannot be normalized away, keeps both
-# factors in [0,1] so the result is too, and leaves transmission_term as the single
-# place T enters -- no double count. A zero in either factor zeroes the objective,
-# which is exactly the gating the split form lacked.
-#
-# Objective count drops 3 -> 2 (or 2 -> 1 with suppression off), so minimax's mean
-# threshold changes with it: with two objectives one is always at or below the
-# mean, and the merged term drives whenever it is the laggard.
-#
-# NOT IMPLEMENTED, the alternative considered -- cheaper but less fundamental:
-# keep the objectives separate and change the SELECTION rule from "f_j <= mean" to
-# "f_j < its own target" (0.9 for level, 1.0 for the others), so an objective short
-# of its own knee is never skipped just because the others happen to be worse.
-# Worth testing as its own factor; it is not obvious which is better.
-W_TRANS = 0.05                 # ("weighted" only, and only with the merge OFF)
-                               # share the level term carries
+W_TRANS = 0.05                 # ("weighted" only) share the level term carries
 W_MODAL = 0.95                 # share the modal block should carry, split by RAMP
 # W_TRANS / W_MODAL are the CONTRIBUTION split. FoM = _ST*level_score + _SM*match
 # (see transmission_J / match_J) is a literal convex combination of two [0,1]
@@ -350,10 +292,6 @@ _SOURCE_POL_DEG = {"x": 0.0, "y": 90.0, "xy": 45.0}[SOURCE_POL]
 # IS the incoherent sum over the two polarizations.
 FORWARD_POLS = [0.0, 90.0] if NOSYM_DESIGN else [_SOURCE_POL_DEG]
 MODE_WEIGHTS = None            # None -> equal weight per (angle, order)
-# Both are dead weights under MERGE_LEVEL_INTO_MATCH -- level and match are no
-# longer two contributions to blend, and merged_J takes no prefactor -- but they
-# are still computed unconditionally because WM below is derived from them and
-# feeds the per-mode ramp weights the SUPPRESS term still scores with.
 _WSUM = float(W_TRANS) + float(W_MODAL)
 _ST, _SM = float(W_TRANS) / _WSUM, float(W_MODAL) / _WSUM
 if MULTIOBJ == "minimax":
@@ -377,6 +315,7 @@ PLOT_EVERY_ITER = True       # structure + per-order purity, one figure per iter
 # Start from a ring grating carrying the requested orders instead of uniform grey.
 # See seeded_x0() for why: a weakly modulated start does not survive the first
 # beta step under a tight parameterisation.
+SEED_HARMONICS = False
 # Symmetry-breaking noise for a uniform start. A perfectly uniform slab is a SADDLE
 # POINT for every target order above zero: c_m = 0 there, so d|c_m|^2/drho =
 # 2*Re(c_m* dc_m/drho) = 0 and no gradient exists to grow them. sqrt(w*p) would
@@ -384,9 +323,10 @@ PLOT_EVERY_ITER = True       # structure + per-order purity, one figure per iter
 # LOG_EPS floor caps dJ/dp and cancels it. Measured on the 4-fold uniform run: the
 # target orders sat at 0.0000/0.0015 and SHRANK over three iterations while only T
 # and the zeroth order moved. This much noise breaks the slab without biasing the
-# design toward any particular order.
+# design toward any particular order -- unlike SEED_HARMONICS, which picks them.
 SEED_NOISE = 0.05
 SEED_NOISE_RNG = 0             # fixed so a rerun reproduces the same start
+SEED_AMPLITUDE = 0.50        # swing about grating_initial_density after std-normalization
 
 # Postprocess polarizations. The dipole sweep runs once per entry, so "x" alone
 # halves the postprocess -- 36 FDTD cases instead of 72, ~1.5 h saved.
@@ -548,62 +488,29 @@ def build_target_modes():
         for line in L["report"]:
             print(f"[k-map] {line}")
         base_w = km.ramp_weights(L["rungs"], RAMP, W_AT_0, W_AT_MAX, RAMP_AXIS)
-        targets, orders, weights, suppress, lattice = [], [], [], [], []
+        targets, orders, weights, suppress = [], [], [], []
         phis = [0.0] if KM_SYMMETRY == "radial" else [float(a) for a in AZIMUTHS_DEG]
 
         def _emit(rung, w, is_suppress):
-            """ONE cone per rung, carrying the rung's COMPLETE symmetry orbit.
-
-            This used to emit one mode per entry in AZIMUTHS_DEG, which for
-            [0, 90] scored (m,0) and (0,m) but never (-m,0) or (0,-m). A 4-fold
-            design puts identical power in all four, so half of every off-axis
-            rung sat in the purity DENOMINATOR without ever appearing in a target
-            term -- a blind spot that made the axial configuration look worse for
-            a reason that has nothing to do with which angles are targeted.
-
-            Grouping the orbit is also what makes the diagonal contrast mean
-            something: with the old form, "diagonals off" changed the target set
-            AND left that blind spot, so the two could not be separated. Now the
-            only difference is whether the diagonal cones are added.
-            """
             if rung["m"] == 0:                    # k-space origin: no azimuth
                 targets.append((0.0, 0.0)); orders.append((0, 0))
                 weights.append(w); suppress.append(is_suppress)
-                lattice.append([(0, 0)])
                 return
-            m = int(rung["m"])
-            if KM_SYMMETRY == "radial":
-                # rho(r,z) has no square-lattice orbit to complete; keep the
-                # historical single representative per azimuth.
-                for ph in phis:
-                    c, sn = np.cos(np.deg2rad(ph)), np.sin(np.deg2rad(ph))
-                    mm, nn = int(round(m * c)), int(round(m * sn))
-                    if (mm, nn) == (0, 0):
-                        continue
-                    targets.append((rung["theta_air_deg"], ph))
-                    orders.append((mm, nn))
-                    weights.append(w)
-                    suppress.append(is_suppress)
-                    lattice.append([(mm, nn)])
-                return
-            # FULL rung weight on the cone, and the cone holds every lattice point
-            # at this |u|. build_target_modes multiplies by len(points) so each
-            # DIRECTION in it asks for ramp(theta) -- a radiance profile, which is
-            # what the postprocess reports (ratio_to_0 in channel_ratios.txt).
-            pts = [(m, 0), (-m, 0), (0, m), (0, -m)]
-            targets.append((rung["theta_air_deg"], 0.0))
-            orders.append((m, 0))
-            weights.append(w)
-            suppress.append(is_suppress)
-            lattice.append(pts)
+            for ph in phis:
+                c, sn = np.cos(np.deg2rad(ph)), np.sin(np.deg2rad(ph))
+                mm, nn = int(round(rung["m"] * c)), int(round(rung["m"] * sn))
+                if (mm, nn) == (0, 0):
+                    continue
+                targets.append((rung["theta_air_deg"], ph))
+                orders.append((mm, nn))
+                weights.append(w / max(len(phis), 1))
+                suppress.append(is_suppress)
 
         if TARGET_ALL_ORDERS and KM_SYMMETRY != "radial":
             targets, orders, weights, suppress, lattice = _all_escaping_orders(
                 period, lam, L)
         else:
-            # lattice stays a list: _emit now fills it with each rung's complete
-            # symmetry orbit (it used to be None because this path scored single
-            # lattice points).
+            lattice = None
             for r, w in zip(L["rungs"], base_w):
                 _emit(r, w, False)
         # Orders past the target that still escape. Nothing forbids raising M -- the
@@ -682,41 +589,6 @@ def build_target_modes():
     if not any(not mo["suppress"] for mo in modes):
         raise ValueError("every surviving mode is a suppression term")
     w = np.asarray([mo["weight"] for mo in modes], dtype=float)
-    # PER-DIRECTION, not per cone. RAMP asks for a RADIANCE profile -- how bright
-    # the panel looks from each angle -- and that is what the postprocess reports
-    # (radiance_per_emitted_power / ratio_to_0 in channel_ratios.txt). But a cone
-    # is several lattice points and modal_purity_terms scores their SUM, so a raw
-    # ramp weight on the cone asks for the RING TOTAL instead. The two differ by
-    # the point count, which is not a constant: 1 at normal incidence, 4 for
-    # (m,0)/(0,m) and (m,m), and 8 for (2,1)-type cones. Measured on the 45 deg /
-    # 3-order ladder, a requested 1.00 -> 0.90 came out as 1.00 -> 0.23 per
-    # direction, and 31.94 deg (8 points) landed at 1/8.6 of normal -- which is
-    # why in-opt match 0.847 sat against a postprocess angular_shape_score of
-    # 0.394 on run 20260811_055547, and why its 45/0 radiance ratio missed the
-    # window at 0.712. Multiplying by the multiplicity makes the cone total
-    # ramp(theta) * n_points, so each DIRECTION in it carries ramp(theta).
-    npts = np.asarray([len(mo["points"]) for mo in modes], dtype=float)
-    w = w * npts
-    # SOLID ANGLE, the second half of the same correction. The multiplicity above
-    # fixes "a cone holds several directions"; this fixes "a direction is not a
-    # solid angle". Every diffraction order owns the same area in DIRECTION-COSINE
-    # space -- one lattice cell, (lambda/P)^2, independent of the order -- but
-    # dOmega = du_x du_y / cos(theta), so that fixed cell subtends MORE solid angle
-    # the further off axis it sits. Radiance is power per solid angle, hence
-    #     radiance(theta) = power(theta) * cos(theta)
-    # which is exactly what the postprocess computes (see radiance_from_spectrum:
-    # "multiply by cos(theta) before averaging to recover a per-solid-angle
-    # quantity"). Asking for power = ramp(theta) therefore delivers radiance =
-    # ramp(theta)*cos(theta), so the request has to be divided by cos(theta).
-    #
-    # Measured, not argued: run s4 (20260812_144932) drove match to 0.9779 -- it
-    # satisfied the old target almost exactly -- and its postprocess reported a
-    # 45/0 radiance ratio of 0.631, against 0.90*cos(45.22) = 0.6339 predicted by
-    # this very omission. 0.5% apart. Without this line the requested window
-    # [0.80, 0.90] is unreachable no matter how good the design is: 0.634 is the
-    # ceiling.
-    w = w / np.cos(np.deg2rad(np.asarray([mo["theta_air_deg"] for mo in modes],
-                                         dtype=float)))
     # The modal weights share out W_MODAL; the transmission term holds W_TRANS.
     # Normalizing the pair means 0.1/0.9 and 1/9 are the same request.
     w = WM * w / max(float(np.sum(w)), 1e-30)
@@ -928,7 +800,18 @@ def modal_purity_terms(Ex, Ey):
     unbounded scores.
     """
     Es = _pol_components(Ex, Ey)
-    denom = sum(npa.sum(npa.abs(E) ** 2) for E in Es) + 1e-30
+    if MODAL_METRIC == "absolute":
+        # ABSOLUTE modal coupling, referenced to the planar device: the mean
+        # intensity sitting in mode i, in units of the planar EML intensity. Equal
+        # to purity * T, so it carries level and shape in one number and the FoM
+        # needs no separate level term to stop the optimizer from perfecting the
+        # shape of nothing. sqrt(w*a) is concave, so dJ/da = 0.5*sqrt(w/a) is
+        # largest for the starved order -- raising the total uniformly is always
+        # worth less than feeding whichever order is behind, which is the job the
+        # purity denominator used to do.
+        denom = float(Es[0].shape[0] * Es[0].shape[1]) * _trans_ref(None)
+    else:
+        denom = sum(npa.sum(npa.abs(E) ** 2) for E in Es) + 1e-30
     terms = []
     for projs in PROJECTORS:
         # Every (lattice point, field component) pair in this cone. With a single
@@ -1038,10 +921,9 @@ def transmission_term(Ex, Ey):
     divides S back out, see match_J), so it alone gives no pull to grow S --
     a vanishingly small but perfectly-shaped allocation scores the same as a
     large one. T*S is what supplies that pull, and because match_J never sees
-    T, there is no risk of the older "buy shape score by raising T" failure --
-    shape and level stay cleanly separated by construction. That separation is
-    also why the removed "absolute" metric had nothing to offer: it folded T back
-    into the modal terms this function already carries it for.
+    T, there is no risk of the older "buy shape score by raising T" failure
+    the MODAL_METRIC="absolute" comment above warns about -- shape and level
+    stay cleanly separated by construction.
 
     Both E components are summed regardless of SOURCE_POL: the probe is
     polarized but a structured design converts between components, and power
@@ -1181,13 +1063,7 @@ USE_MFS_FILTER = oc.env_flag("MSOPT_OLED_USE_MFS_FILTER", "0")   # env override
 #             msopt folds EACH LAYER independently (fliplr+flipud+transpose, the
 #             per-z loop in Opt_MS2), so the stack is 4-fold symmetric in plane
 #             while still being multilayer in z -- verified below.
-GRATING_PROFILE = oc.env_str("MSOPT_OLED_GRATING_PROFILE", "freeform")
-                               # env-overridable so the grating-vs-freeform pair
-                               # launches without editing the file. Note the
-                               # interaction with USE_MFS_FILTER: "vertical" with
-                               # the filter OFF is freeform restricted to a single
-                               # extruded layer (Is_freeform[2]), and with it ON is
-                               # the filtered vertical-sidewall grating.
+GRATING_PROFILE = "freeform"
 if GRATING_PROFILE not in ("vertical", "slanted", "freeform"):
     raise ValueError(f"GRATING_PROFILE must be 'vertical' or 'slanted' or 'freeform', got {GRATING_PROFILE!r}")
 VERTICAL_GRATING = (GRATING_PROFILE == "vertical")   # also freeform's single-
@@ -1225,48 +1101,102 @@ if design_parameters is None:
     _single_layer_params = USE_MFS_FILTER or VERTICAL_GRATING
     design_parameters = (G.Nx * G.Ny) if _single_layer_params else G.design_cells
 def seeded_x0():
-    """Uniform density plus BAND-LIMITED noise.
+    """Start from a ring grating that already carries the requested orders.
 
-    Per-pixel white noise does not survive the MFS filter -- at MFS = 0.1 um and
-    dx = 0.02 um the conic kernel averages ~78 cells, so sigma 0.02 arrives as
-    0.002 and the slab is still a slab (measured: p_0 = 0.9917 with noise against
-    0.9918 without). Keeping only |k| <= (M+1)/P puts the randomness on the scales
-    the out-coupler actually uses, with random phases so no order is favoured.
+    A uniform grey start is what killed the fabrication-constrained run. With the
+    vertical-grating constraint the design has only 57 parameters, so msopt
+    reached its beta=1 convergence in ~10 iterations while the profile was still
+    0th-order dominant and barely modulated (p = 0.64/0.027/0.010/0.040). The
+    first beta step then projected that weak modulation flat: binarization 100%,
+    a uniform layer, every order but m=0 gone, and no gradient left to escape --
+    the FoM sat at 0.5989 for ten identical evaluations.
 
-    A harmonic seed (cos(2*pi*m*r/P) per requested order) used to live here behind
-    SEED_HARMONICS. It was hardwired off and is gone; it PICKED the orders, which
-    is the optimizer's job, and the backup is legacy/OLED_rec_preclean_20260811.py.
+    Order m is carried by a radial period P/m, so seeding cos(2*pi*m*r/P) for
+    every requested m puts the rings there before the projection sharpens. It
+    costs nothing and helps the unconstrained parameterisation too.
     """
     base = float(G.grating_initial_density)
     n = int(design_parameters)
-    x = base * np.ones(n)
-    if SEED_NOISE > 0:
-        rng = np.random.default_rng(int(SEED_NOISE_RNG))
-        # BAND-LIMITED, not white. Per-pixel noise does not survive the MFS
-        # filter: at MFS = 0.1 um and dx = 0.02 um the conic kernel averages
-        # ~78 cells, so sigma 0.02 comes out at 0.002 and the slab is still a
-        # slab -- measured, p_0 stayed 0.9917 against 0.9918 for no noise at
-        # all. Keeping only |k| <= 2*pi*(M+1)/P puts the randomness on the
-        # scales the out-coupler actually uses, which the filter passes
-        # (period P/3 = 0.75 um against a 0.1 um feature size), while leaving
-        # the phases random so no particular order is favoured.
-        kmax = (N_ORDERS + 1) / PERIOD                 # cycles per um
-        if n == G.Nx * G.Ny:                           # single layer, 2-D
-            f = rng.standard_normal((G.Nx, G.Ny))
-            kx = np.fft.fftfreq(G.Nx, d=1.0 / G.resolution)
-            ky = np.fft.fftfreq(G.Ny, d=1.0 / G.resolution)
-            mask = (np.hypot(*np.meshgrid(kx, ky, indexing="ij")) <= kmax)
-            f = np.real(np.fft.ifft2(np.fft.fft2(f) * mask)).ravel()
-        else:
-            f = rng.standard_normal(n)
-            kf = np.fft.fftfreq(n, d=1.0 / G.resolution)
-            f = np.real(np.fft.ifft(np.fft.fft(f) * (np.abs(kf) <= kmax)))
-        f = f / max(float(f.std()), 1e-12)
-        x = np.clip(x + SEED_NOISE * f, 0.02, 0.98)
-        print(f"[seed] uniform {base:g} + band-limited noise sigma={SEED_NOISE:g}, "
-              f"|k| <= {kmax:.4f}/um (rng {SEED_NOISE_RNG}): "
-              f"rho in [{x.min():.3f}, {x.max():.3f}]")
+    if not SEED_HARMONICS:
+        x = base * np.ones(n)
+        if SEED_NOISE > 0:
+            rng = np.random.default_rng(int(SEED_NOISE_RNG))
+            # BAND-LIMITED, not white. Per-pixel noise does not survive the MFS
+            # filter: at MFS = 0.1 um and dx = 0.02 um the conic kernel averages
+            # ~78 cells, so sigma 0.02 comes out at 0.002 and the slab is still a
+            # slab -- measured, p_0 stayed 0.9917 against 0.9918 for no noise at
+            # all. Keeping only |k| <= 2*pi*(M+1)/P puts the randomness on the
+            # scales the out-coupler actually uses, which the filter passes
+            # (period P/3 = 0.75 um against a 0.1 um feature size), while leaving
+            # the phases random so no particular order is favoured.
+            kmax = (N_ORDERS + 1) / PERIOD                 # cycles per um
+            if n == G.Nx * G.Ny:                           # single layer, 2-D
+                f = rng.standard_normal((G.Nx, G.Ny))
+                kx = np.fft.fftfreq(G.Nx, d=1.0 / G.resolution)
+                ky = np.fft.fftfreq(G.Ny, d=1.0 / G.resolution)
+                mask = (np.hypot(*np.meshgrid(kx, ky, indexing="ij")) <= kmax)
+                f = np.real(np.fft.ifft2(np.fft.fft2(f) * mask)).ravel()
+            else:
+                f = rng.standard_normal(n)
+                kf = np.fft.fftfreq(n, d=1.0 / G.resolution)
+                f = np.real(np.fft.ifft(np.fft.fft(f) * (np.abs(kf) <= kmax)))
+            f = f / max(float(f.std()), 1e-12)
+            x = np.clip(x + SEED_NOISE * f, 0.02, 0.98)
+            print(f"[seed] uniform {base:g} + band-limited noise sigma={SEED_NOISE:g}, "
+                  f"|k| <= {kmax:.4f}/um (rng {SEED_NOISE_RNG}): "
+                  f"rho in [{x.min():.3f}, {x.max():.3f}]")
+        return x
+    orders_2d = sorted({max(mo["m"], mo["n"]) for mo in target_modes
+                        if not mo["suppress"]} - {0})
+    if not RADIAL_DESIGN:
+        # Single-layer 2-D: cos(2*pi*m*x/P) + cos(2*pi*m*y/P) puts content on the
+        # (m,0) and (0,m) orders, which are exactly the fourfold targets. Same
+        # std-normalize-then-clip as the radial branch.
+        if n != G.Nx * G.Ny or not orders_2d:
+            print("[seed] harmonic seed needs the single-layer 2-D parameterisation; "
+                  "starting uniform")
+            return base * np.ones(n)
+        x_um = np.linspace(-0.5 * G.design_s[0], 0.5 * G.design_s[0], G.Nx)
+        y_um = np.linspace(-0.5 * G.design_s[1], 0.5 * G.design_s[1], G.Ny)
+        X, Y = np.meshgrid(x_um, y_um, indexing="ij")
+        prof = np.zeros_like(X)
+        for m in orders_2d:
+            prof += np.cos(2.0 * np.pi * m * X / PERIOD) + np.cos(2.0 * np.pi * m * Y / PERIOD)
+        prof = prof / max(float(prof.std()), 1e-12)
+        out = np.clip(base + SEED_AMPLITUDE * prof, 0.02, 0.98).ravel()
+        print(f"[seed] 2-D harmonic seed on orders {orders_2d}, amplitude "
+              f"{SEED_AMPLITUDE}: rho in [{out.min():.3f}, {out.max():.3f}], "
+              f"{n:,} parameters")
+        return out
+    nr = int(radial_grids)
+    if n % nr:
+        print(f"[seed] unexpected parameter count {n} for {nr} radial samples; "
+              f"starting uniform")
+        return base * np.ones(n)
+    orders = sorted({max(mo["m"], mo["n"]) for mo in target_modes
+                     if not mo["suppress"]} - {0})
+    if not orders:
+        return base * np.ones(n)
+    r = np.linspace(0.0, float(radial_radius), nr)
+    prof = np.zeros(nr)
+    for m in orders:
+        prof += np.cos(2.0 * np.pi * m * r / PERIOD)
+    # Normalize by the STD, not by the sum length or the peak. The harmonics are
+    # all in phase at r = 0, so the raw sum is a spike: dividing it by len(orders)
+    # or by its own maximum leaves every harmonic at 1/M of the available swing,
+    # and at M = 6 that seeded orders 3-6 at purity ~0.004. Scaling by the std and
+    # letting the profile clip gives a quasi-binary ring pattern -- measured
+    # harmonic content 0.133-0.191 per order against 0.075 before, and still even
+    # across orders (staggering the phases instead spreads them 0.05-0.32).
+    prof = prof / max(float(prof.std()), 1e-12)
+    prof = np.clip(base + SEED_AMPLITUDE * prof, 0.02, 0.98)
+    # parameter_shape is (N_radius,) with vertical_grating, else (N_radius,
+    # N_height) in r-major order -- repeat the same profile down z.
+    x = prof if n == nr else np.repeat(prof[:, None], n // nr, axis=1).ravel()
+    print(f"[seed] harmonic seed on orders {orders}, amplitude {SEED_AMPLITUDE}: "
+          f"rho in [{x.min():.3f}, {x.max():.3f}], {n:,} parameters")
     return x
+
 
 x0 = seeded_x0()
 dJ_0 = np.zeros(G.design_cells)
@@ -1321,43 +1251,24 @@ def match_J(mode_indices):
     Always in (0, ~1]: exp() of a real number is never negative, so this needs
     none of the non-negativity care _sep_score's docstring warns is required
     elsewhere.
-
-    The math itself lives in _match_rate, which returns the bare rate; this
-    function only applies the _SM weight the SPLIT form needs. merged_J calls
-    _match_rate directly, because a product with the level score is bounded by
-    construction and wants no prefactor at all.
-    """
-    core = _match_rate(mode_indices)
-
-    def J(Ex, Ey):
-        # Weighted by _SM so FoM = _ST*level_score + _SM*match is a proper
-        # convex combination (_ST + _SM = 1) of two [0,1]-bounded terms,
-        # keeping the WHOLE FoM in [0,1] instead of just this term -- see
-        # transmission_J / level_score for the matching half of this.
-        return _SM * core(Ex, Ey)
-    return J
-
-
-def _match_rate(mode_indices):
-    """The distribution-match rate itself, unweighted, in (0, ~1].
-
-    Everything about WHY it is shaped this way is in match_J's docstring; this
-    is only the closure both match_J (times _SM) and merged_J (times the level
-    score) evaluate.
     """
     idx = list(mode_indices)
     w = np.asarray([target_modes[i]["weight"] for i in idx], dtype=float)
     w_hat = w / max(float(np.sum(w)), 1e-30)
     ceiling_ln = float(np.sum(w_hat * np.log(w_hat + LOG_EPS)))
 
-    def rate(Ex, Ey):
+    def J(Ex, Ey):
         all_p = modal_purity_terms(Ex, Ey)
         p_list = [all_p[i] for i in idx]
         S = sum(p_list) + LOG_EPS
         ln_raw = sum(wh * npa.log(npa.maximum(pi / S, 0.0) + LOG_EPS)
                      for wh, pi in zip(w_hat, p_list))
-        return npa.exp(ln_raw - ceiling_ln)
-    return rate
+        # Weighted by _SM so FoM = _ST*level_score + _SM*match is a proper
+        # convex combination (_ST + _SM = 1) of two [0,1]-bounded terms,
+        # keeping the WHOLE FoM in [0,1] instead of just this term -- see
+        # transmission_J / level_score for the matching half of this.
+        return _SM * npa.exp(ln_raw - ceiling_ln)
+    return J
 
 
 def grouped_suppress_J(mode_indices, weight):
@@ -1375,8 +1286,8 @@ def grouped_suppress_J(mode_indices, weight):
         terms = modal_purity_terms(Ex, Ey)
         tot = sum(terms[i] for i in mode_indices)
         if MULTIOBJ == "minimax":
-            # LEAK BUDGET, not "1 - leak". Measured on run A (minimax, diagonals
-            # + suppression ON): minimax reported driving J[2] on EVERY
+            # LEAK BUDGET, not "1 - leak". Measured on run A (minimax, absolute,
+            # diagonals + suppression ON): minimax reported driving J[2] on EVERY
             # single iteration -- the suppression objective never steered once --
             # and the postprocess then showed the entire LEE gain landing ABOVE
             # the target (40-80 deg went from 26.0% of extracted light on the bare
@@ -1396,81 +1307,20 @@ def grouped_suppress_J(mode_indices, weight):
 
 
 def transmission_J(Ex, Ey):
-    """SPLIT form only (MERGE_LEVEL_INTO_MATCH off): the bounded level score,
-    weighted by _ST so FoM = _ST*level_score + _SM*match is a proper convex
-    combination -- see level_score and match_J's matching _SM weighting."""
+    """Objective 1: the bounded level score, weighted by _ST so FoM =
+    _ST*level_score + _SM*match is a proper convex combination -- see
+    level_score and match_J's matching _SM weighting."""
     return _ST * level_score(transmission_term(Ex, Ey))
 
 
-_LAST_LEVEL_MATCH = [None]     # see merged_J's reporting-cache note
-
-
-def merged_J(mode_indices):
-    """The whole steering FoM as ONE objective: level_score(T*S) * match(p).
-
-    The two factors answer different questions and neither can substitute for
-    the other -- how MUCH of the probe reached the target momenta at all
-    (level, the only term that sees the captured share S) and how that capture
-    is SHARED OUT against the requested ramp (match, deliberately blind to S).
-    Scored separately they do not cooperate; multiplied they do. The full
-    argument, and the measurement that forced the change, is at
-    MERGE_LEVEL_INTO_MATCH.
-
-    No prefactor. Both factors are already [0, 1], so the product is too --
-    _ST/_SM exist only to make the SPLIT form's sum bounded and have nothing
-    to weight here. Under minimax they are 1.0 anyway, so this is literally
-    the J1*J2 the split form was already computing, just multiplied instead of
-    added -- and therefore directly comparable against those runs' numbers.
-
-    Non-negative by construction (a ratio of non-negatives times an exp), so
-    it satisfies the positive-FoM requirement _sep_score's docstring spells
-    out. It is also strictly gated: either factor going to 0 takes the
-    objective with it, which is the property the sum could not express.
-
-    One objective means ONE adjoint. autograd traces the product exactly --
-    d(L*M) = M*dL + L*dM comes out of the same single backward pass, so this
-    is not just cheaper than two adjoints, it is the exact gradient of the
-    quantity actually being maximized.
-
-    S IS NOT DOUBLE-COUNTED. transmission_term multiplies T by the same sum of
-    non-suppressed purities that _match_rate normalizes by, but match divides
-    it back out completely (p_hat = p/S), so S enters the product exactly
-    once, through the level factor. This is the distinction that made the
-    removed "absolute" metric pointless and makes this merge work.
-
-    The level/match split is still what gets REPORTED, so both are cached
-    detached here on the way through. Same scheme, and same caveat, as
-    modal_purity_terms' _LAST_PURITIES: with two forwards the cache holds the
-    last one, while per_J is averaged over both, so the printed level/match
-    are that forward's rather than the mean. The product in per_J is exact
-    either way; only the breakdown is approximate.
-    """
-    core = _match_rate(mode_indices)
-
-    def J(Ex, Ey):
-        lvl = level_score(transmission_term(Ex, Ey))
-        mat = core(Ex, Ey)
-        _LAST_LEVEL_MATCH[0] = (float(getval(lvl)), float(getval(mat)))
-        return lvl * mat
-    return J
-
-
-# Objective 1 is the steering term over every non-suppressed target mode --
-# either the merged level*match product (default) or, with the merge off, the
-# level (now T*S, see transmission_term) and the ONE joint distribution-match
-# term as two separate objectives. Suppressed modes (if any) share one more.
-# See MERGE_LEVEL_INTO_MATCH for why the merged form is the default.
+# Objective 1 is transmission (now T*S, see transmission_term); objective 2 is
+# the ONE joint distribution-match term over every non-suppressed target mode;
+# suppressed modes (if any) share one more.
+OBJ_SPECS = [{"kind": "trans", "idx": []}]
 _target_idx = [i for i, mo in enumerate(target_modes) if not mo["suppress"]]
+if _target_idx:
+    OBJ_SPECS.append({"kind": "match", "idx": _target_idx})
 _sup_idx = [i for i, mo in enumerate(target_modes) if mo["suppress"]]
-# Merging needs something to merge WITH: with no unsuppressed target there is no
-# match term at all, so the level term stands alone exactly as in the split form.
-_MERGED = bool(MERGE_LEVEL_INTO_MATCH and _target_idx)
-if _MERGED:
-    OBJ_SPECS = [{"kind": "merged", "idx": _target_idx}]
-else:
-    OBJ_SPECS = [{"kind": "trans", "idx": []}]
-    if _target_idx:
-        OBJ_SPECS.append({"kind": "match", "idx": _target_idx})
 if _sup_idx:
     if SUPPRESS_AGGREGATE:
         OBJ_SPECS.append({"kind": "suppress", "idx": _sup_idx})
@@ -1479,8 +1329,6 @@ if _sup_idx:
 
 
 def objective_for(spec):
-    if spec["kind"] == "merged":
-        return merged_J(spec["idx"])
     if spec["kind"] == "trans":
         return transmission_J
     if spec["kind"] == "match":
@@ -1492,8 +1340,6 @@ def objective_for(spec):
 
 
 def spec_label(s):
-    if s["kind"] == "merged":
-        return "level_x_match"
     if s["kind"] == "trans":
         return "eml_intensity"
     if s["kind"] == "match":
@@ -1505,11 +1351,8 @@ def spec_label(s):
 
 OBJECTIVES = [objective_for(s) for s in OBJ_SPECS]
 OBJ_LABELS = [spec_label(s) for s in OBJ_SPECS]
-print(f"[fom] {len(OBJECTIVES)} objective(s) = "
-      + (f"1 merged level*match (unweighted, over {len(_target_idx)} target order(s))"
-         if _MERGED else
-         f"1 captured level (w={_ST:.3f})"
-         f" + 1 distribution-match (w={_SM:.3f}, over {len(_target_idx)} target order(s))")
+print(f"[fom] {len(OBJECTIVES)} objective(s) = 1 captured level (w={_ST:.3f})"
+      f" + 1 distribution-match (w={_SM:.3f}, over {len(_target_idx)} target order(s))"
       + (f" + {sum(1 for s in OBJ_SPECS if s['kind']=='suppress')} suppress"
          f" (covering {len(_sup_idx)} order(s))" if _sup_idx else "")
       + f"  -> {len(OBJECTIVES)} adjoint run(s) per iteration")
@@ -1565,29 +1408,7 @@ def _wrap_one(sim, idx):
         objective_arguments=[0, 1],
         FoM_size=eml_s,
         FoM_center=eml_c,
-        # The adjoint source sits ON the FoM plane (the EML mid-plane) and has to
-        # reach the DESIGN, which is 0.30 um ABOVE it -- design z = -0.1785 against
-        # FoM z = -0.4740. Lumerical injects "forward" as +axis, so +z is what
-        # points at the design. False sent it downward, away from the design; the
-        # Ag mirror underneath bounced enough of it back up that a gradient still
-        # existed and the FoM still climbed, which is exactly why this went
-        # unnoticed -- the adjoint field in the design region was a mirror-delayed
-        # copy with the wrong phase and amplitude, so every step was a poor
-        # approximation of the true gradient. That is the likeliest reason a
-        # 204k-parameter freeform run crawled and stalled where it should have had
-        # the most room to move.
-        #
-        # ROOT CAUSE, so the same class of defect is easier to find elsewhere:
-        # this script was ported from the dipole-EMISSION formulation, where the
-        # source sits AT the EML and the FoM plane is above it -- there the
-        # adjoint really does travel downward. The reciprocal form swaps those
-        # two: the probe moved to the top and the FoM plane became the EML. Every
-        # direction-bearing parameter had to flip with them, and this one did not.
-        # Anything else inherited from that ancestor which encodes an orientation
-        # (monitor normal, injection axis, source direction, which side of the
-        # design the FoM sits on) is worth re-deriving rather than trusted. Not reached when broadband_adjoint is on, which
-        # takes a different source-creation path (Lumerical_utill ~L1874 vs L1932).
-        adj_fwd=True,
+        adj_fwd=False,
         opt_idx=idx,
         broadband_adjoint=BROADBAND_ADJOINT,
         Incoherent=PER_MODE_ADJOINT,
@@ -1620,26 +1441,17 @@ def _split_per_J(per_J):
     Purities are read straight from _LAST_PURITIES, not inverted out of
     per_J: there is no longer one objective per mode to invert (match_J
     scores all of them jointly), so per-mode purities only ever exist as the
-    cache modal_purity_terms already left behind. Under the merged FoM the
-    same is true of level and match themselves -- one objective carries their
-    PRODUCT, which cannot be factored back apart, so merged_J caches the pair
-    on its way through and this reads it back.
-
-    In the split form level and match are each read back UNWEIGHTED (divide
-    out _ST / _SM) so what gets reported and plotted is the same [0,1]
-    diagnostic quantity regardless of the FoM split -- transmission_J /
-    match_J each hand msopt the WEIGHTED value, since that is what has to sum
-    to a bounded total FoM. The merged term is unweighted to begin with.
+    cache modal_purity_terms already left behind. level and match are each
+    read back UNWEIGHTED (divide out _ST / _SM) so what gets reported and
+    plotted is the same [0,1] diagnostic quantity regardless of the FoM split
+    -- transmission_J / match_J each hand msopt the WEIGHTED value, since
+    that is what has to sum to a bounded total FoM.
     """
     level, match = float("nan"), float("nan")
     for i, s in enumerate(OBJ_SPECS):
         if i >= len(per_J):
             break
-        if s["kind"] == "merged":
-            lm = _LAST_LEVEL_MATCH[0]
-            if lm is not None:
-                level, match = lm
-        elif s["kind"] == "trans":
+        if s["kind"] == "trans":
             level = float(per_J[i]) / _ST if _ST > 0 else float("nan")
         elif s["kind"] == "match":
             match = float(per_J[i]) / _SM if _SM > 0 else float("nan")
@@ -1752,11 +1564,7 @@ def make_rec_loop(opts, hist, mode_records):
             gs.append(gk)
             rows.append(list(getattr(o, "f0_per_J", []) or
                              [float(np.real(np.sum(f0k)))]))
-            # None entries are objectives minimax pre-selected away (above the
-            # mean, so their gradient would have been zero-weighted anyway) --
-            # msopt never runs their adjoint now, so report nan rather than
-            # feeding None to np.linalg.norm.
-            gnorms.append([float("nan") if gj is None else float(np.linalg.norm(gj))
+            gnorms.append([float(np.linalg.norm(gj))
                            for gj in getattr(o, "gradient_per_J", [])])
         f0, g = f0s[0], gs[0]
         per_J = _mean_per_J(rows)
@@ -1797,84 +1605,387 @@ def make_rec_loop(opts, hist, mode_records):
     return loop
 
 
-# ---- figures -----------------------------------------------------------------
-# Moved to oled_rec_plots.py; bound here so the call sites below stay unchanged.
-# bind() must run AFTER every configuration global above exists.
-import oled_rec_plots as _plots
-_plots.bind(globals())
-_draw_stack = _plots._draw_stack
-plot_kmap_geometry = _plots.plot_kmap_geometry
-plot_angle_mapping = _plots.plot_angle_mapping
-plot_iteration_state = _plots.plot_iteration_state
-iter_plot = _plots.iter_plot
+def _draw_stack(ax, x0, x1, show_names=True):
+    """The layer stack in cross-section, drawn from the geometry actually built."""
+    for L in G.stack_layers:
+        zc, dz = L["center"][2], L["size"][2]
+        nr = float(L["index"]["n"][0])
+        kr = float(L["index"].get("k", [0.0])[0])
+        metal = kr > 0.5
+        ax.add_patch(plt.Rectangle((x0, zc - 0.5 * dz), x1 - x0, dz,
+                                   facecolor="#8a8a8a" if metal else
+                                   plt.cm.Blues(0.15 + 0.55 * (nr - 1.7) / 0.6),
+                                   edgecolor="none", zorder=1))
+        if show_names and dz > 0.02 and L["name"] != "EML":
+            ax.text(x1 - 0.02 * (x1 - x0), zc, f"{L['name']}  n={nr:.2f}",
+                    fontsize=6.0, ha="right", va="center",
+                    color="w" if metal else "#123", zorder=6)
+    dz = G.design_s[2]
+    ax.add_patch(plt.Rectangle((x0, G.design_c[2] - 0.5 * dz), x1 - x0, dz,
+                               facecolor="#ffd9a0", edgecolor="#e08b00",
+                               hatch="///", lw=1.2, zorder=2))
+    ax.text(x0 + 0.02 * (x1 - x0), G.design_c[2], "design (out-coupler)",
+            fontsize=7, va="center", color="#7a4a00", zorder=6)
+    ax.axhline(eml_c[2], color="#b00020", lw=1.4, ls="--", zorder=4)
+    ax.text(x0 + 0.02 * (x1 - x0), eml_c[2] - 0.035,
+            f"EML plane  n={N_EML:.2f}", fontsize=7, color="#b00020", zorder=6)
 
 
-def pp_grid_for_this_run():
-    """The dipole grid this run's POSTPROCESS will end up using.
+def plot_kmap_geometry(path=None):
+    """What the pitch k_mapping chose actually does, in real space.
 
-    resolve_dipole_grid decides from the DESIGN's mirror symmetry, which does not
-    exist yet before the optimization runs. The symmetry is a CONSTRAINT of this
-    run though, so it is already known: fourfold/radial designs come out
-    mirror-symmetric and fold to 12x12, a SYMMETRY="none" design does not and
-    stays 6x6. Probing with a matching dummy density asks resolve_dipole_grid the
-    question in its own terms rather than duplicating its rule here.
+    Left  the forward run this script optimizes: one normal-incidence plane wave
+          from air, diffracted by the design into the discrete internal angles.
+    Right the emission it stands for. By reciprocity the same coefficient governs
+          a ray leaving the EML at that internal angle and exiting into air at the
+          target angle -- which is the pairing the FoM is really requesting.
     """
-    if NOSYM_DESIGN:
-        probe = np.random.default_rng(0).random(G.design_grids)   # not mirror-symmetric
-    else:
-        probe = np.zeros(G.design_grids, dtype=float)             # trivially symmetric
-    return oc.resolve_dipole_grid(probe)[0]
+    path = path or os.path.join(G.design_dir, "OLED_rec_kmap_geometry.png")
+    P = float(PERIOD)
+    x0, x1 = -0.62 * P, 0.62 * P
+    z_des_top = G.design_c[2] + 0.5 * G.design_s[2]
+    z_des_bot = G.design_c[2] - 0.5 * G.design_s[2]
+    # Air is trimmed to what the outgoing rays need. The panels are set to EQUAL
+    # aspect further down so the drawn angles ARE the angles -- with the default
+    # auto aspect a 23 deg ray in a 0.4 um stack under a 2.2 um period renders
+    # almost vertical, which is exactly the thing this figure exists to show.
+    z_top = z_des_top + 0.62
+    z_bot = G.Z_min
+    z_anode = max(L["center"][2] + 0.5 * L["size"][2] for L in G.stack_layers
+                  if "anode" in L["name"].lower()) if any(
+        "anode" in L["name"].lower() for L in G.stack_layers) else z_bot
+
+    tgt, seen = [], set()
+    for mo in target_modes:
+        if mo["suppress"] or round(mo["u"], 9) in seen:
+            continue
+        seen.add(round(mo["u"], 9))
+        tgt.append(mo)
+    cols = plt.cm.viridis(np.linspace(0.05, 0.85, max(len(tgt), 1)))
+
+    fig, (aL, aR) = plt.subplots(1, 2, figsize=(14.0, 6.0), sharey=True)
+    for ax in (aL, aR):
+        _draw_stack(ax, x0, x1, show_names=(ax is aR))
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(z_bot, z_top)
+        ax.set_aspect("equal")                    # so the drawn angles are the angles
+        ax.set_xlabel(r"x ($\mu$m)")
+        for xb in (-0.5 * P, 0.5 * P):
+            ax.axvline(xb, color="#e08b00", lw=0.9, ls=":", zorder=3)
+        zp = z_des_top + 0.07
+        ax.annotate("", xy=(0.5 * P, zp), xytext=(-0.5 * P, zp),
+                    arrowprops=dict(arrowstyle="<->", color="#e08b00", lw=1.4), zorder=6)
+        ax.text(0.0, zp + 0.02, f"P = {P:.4f} $\\mu$m", ha="center", fontsize=8.5,
+                color="#7a4a00", zorder=6)
+    aL.set_ylabel(r"z ($\mu$m)")
+
+    # ---- left: the forward probe ---------------------------------------------
+    for xs in np.linspace(-0.5 * P, 0.5 * P, 7):
+        aL.annotate("", xy=(xs, z_des_top), xytext=(xs, z_top - 0.06),
+                    arrowprops=dict(arrowstyle="-|>", color="#1f4e79", lw=1.5), zorder=5)
+    aL.text(0.0, z_top - 0.04, r"normal-incidence probe, $\theta_{air}=0^\circ$",
+            ha="center", va="top", fontsize=9, color="#1f4e79", zorder=6)
+    # Carry the diffracted rays all the way to the anode mirror, not just to the
+    # EML: over the 0.14 um from the design to the EML even a 23 deg ray shifts by
+    # 0.06 um and reads as vertical.
+    run = z_des_bot - z_anode
+    for c, mo in zip(cols, tgt):
+        t = np.deg2rad(mo["theta_eml_deg"])
+        dx = run * np.tan(t)
+        for sgn in ((1, -1) if dx > 1e-9 else (1,)):
+            aL.annotate("", xy=(sgn * dx, z_anode), xytext=(0.0, z_des_bot),
+                        arrowprops=dict(arrowstyle="-|>", color=c, lw=1.8), zorder=5)
+            xe = (z_des_bot - eml_c[2]) * np.tan(t) * sgn
+            aL.plot([xe], [eml_c[2]], "o", ms=4.5, color=c, mec="w", mew=0.6, zorder=7)
+        aL.plot([], [], "-", color=c, lw=1.8,
+                label=f"m={max(mo['m'], mo['n'])}: $u$={mo['u']:.3f}, "
+                      f"$\\theta_{{EML}}$={mo['theta_eml_deg']:.1f}$^\\circ$")
+    aL.set_title("forward: 0$^\\circ$ plane wave $\\rightarrow$ target diffraction "
+                 "angles in the EML", fontsize=10)
+    aL.legend(fontsize=7.5, loc="lower left", framealpha=0.92)
+
+    # ---- right: the emission it is equivalent to ------------------------------
+    rise = z_des_bot - eml_c[2]
+    out = z_top - z_des_top - 0.10
+    for c, mo in zip(cols, tgt):
+        ti, ta = np.deg2rad(mo["theta_eml_deg"]), np.deg2rad(mo["theta_air_deg"])
+        xs = -0.30 * P                            # common launch point on the EML
+        xm = xs + rise * np.tan(ti)
+        aR.annotate("", xy=(xm, z_des_bot), xytext=(xs, eml_c[2]),
+                    arrowprops=dict(arrowstyle="-|>", color=c, lw=1.8), zorder=5)
+        aR.plot([xm, xm], [z_des_bot, z_des_top], "-", color=c, lw=1.0,
+                alpha=0.5, zorder=5)
+        xe = xm + out * np.tan(ta)
+        aR.annotate("", xy=(xe, z_des_top + out), xytext=(xm, z_des_top),
+                    arrowprops=dict(arrowstyle="-|>", color=c, lw=1.8), zorder=5)
+        aR.text(xe, z_des_top + out + 0.03, f"{mo['theta_air_deg']:.0f}$^\\circ$",
+                color=c, fontsize=9, ha="center", va="bottom", zorder=6,
+                fontweight="bold")
+        aR.plot([], [], "-", color=c, lw=1.8,
+                label=f"{mo['theta_eml_deg']:.1f}$^\\circ$ in EML "
+                      f"$\\rightarrow$ {mo['theta_air_deg']:.1f}$^\\circ$ in air")
+    aR.plot([-0.30 * P], [eml_c[2]], "*", ms=13, color="#b00020", zorder=7)
+    aR.set_title("emission (reciprocal): each target order $\\rightarrow$ its air angle",
+                 fontsize=10)
+    aR.legend(fontsize=7.5, loc="lower left", framealpha=0.92)
+
+    fig.suptitle(f"k-mapping result: pitch {P:.4f} $\\mu$m "
+                 f"($\\lambda$={LAM:g} $\\mu$m, $\\lambda/P$={LAM / P:.4f}), "
+                 f"{len(tgt)} target order(s), {SYMMETRY} symmetry", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] k-map geometry -> {path}")
 
 
-def ensure_planar_reference():
-    """Measure the PLANAR reference first if this configuration has none.
+def plot_angle_mapping(path=None):
+    """Free-space emission angle vs the EML-internal angle it is fed by.
 
-    Every design postprocess overlays that curve as the black dashed line, and it
-    is keyed to stack, wavelength, pitch, monitor, resolution, dipole grid AND
-    source layout (planar_reference_identity). Discovering it is missing only at
-    the END -- after a multi-hour optimization -- costs the whole overlay for that
-    run, and the layout/grid defaults have already changed twice. Measuring it
-    HERE costs ~30 min once; every later run in the same configuration reuses it.
-
-    Placed before build_problem for the same reason measure_planar_reference is:
-    its Lumerical session opens and closes while the optimization session does not
-    yet exist, so the licence server is never asked for two solves at once.
-
-    Note the planar postprocess writes its own artifacts into this run's design
-    dir; the run's real postprocess overwrites them at the end. The durable output
-    is Planer_data.txt, which lives next to the scripts.
+    The whole formulation lives in u = k_par/k0 because that is what a planar stack
+    conserves; this is the picture of what that means in angles. u = sin(theta_air)
+    = n_org*sin(theta_EML), so the internal angles are compressed by refraction --
+    the entire escape cone is theta_EML < asin(1/n_org), and everything past it is
+    trapped no matter what the out-coupler does.
     """
-    if not oc.env_flag("MSOPT_OLED_REQUIRE_PLANAR_REF", "1"):
-        return
-    if oc.planar_requested():
-        return                      # this run IS the planar measurement
-    grid_n = pp_grid_for_this_run()
-    ident = oc.planar_reference_identity(G, grid_n)
-    if oc.load_planar_reference_curve(identity=ident)[0] is not None:
-        print(f"[planar] reference matches this configuration ({ident})")
-        return
-    print(f"[planar] no reference for {ident}")
-    print("[planar] measuring the bare stack FIRST so the postprocess overlay exists")
-    # PIN THE GRID to the one this run's postprocess will use. The planar density
-    # is uniform, hence trivially mirror-symmetric, so resolve_dipole_grid would
-    # always fold it to 12x12 -- even for a SYMMETRY="none" run whose own
-    # postprocess stays at 6x6. The reference would then be measured on different
-    # dipole positions than the design it is meant to be overlaid against, and the
-    # identity check would reject it right after paying for it.
-    os.environ["MSOPT_OLED_PP_PLANAR"] = "low"
-    os.environ["MSOPT_OLED_PP_DIPOLE_GRID"] = str(grid_n)
+    path = path or os.path.join(G.design_dir, "OLED_rec_angle_mapping.png")
+    n = float(N_ORG)
+    th_air = np.linspace(0.0, 90.0, 721)
+    u = np.sin(np.deg2rad(th_air))
+    th_org = np.rad2deg(np.arcsin(np.clip(u / n, 0.0, 1.0)))
+    crit = float(np.rad2deg(np.arcsin(min(1.0 / n, 1.0))))
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.4, 5.2))
+    ax.plot(th_air, th_org, "-", color="#1f4e79", lw=2.0,
+            label=f"$u=\\sin\\theta_{{air}}=n\\,\\sin\\theta_{{EML}}$, n={n:.3f}")
+    ax.axhline(crit, color="#b00020", ls="--", lw=1.4,
+               label=f"escape cone limit  {crit:.2f}$^\\circ$")
+    ax.fill_between([0, 90], crit, 90, color="#b00020", alpha=0.07)
+    tgt = [m for m in target_modes if not m["suppress"]]
+    sup = [m for m in target_modes if m["suppress"]]
+    seen = set()
+    for mo in tgt:
+        key = round(mo["u"], 9)
+        if key in seen:
+            continue
+        seen.add(key)
+        ax.plot([mo["theta_air_deg"]], [mo["theta_org_deg"]], "o", ms=8,
+                color="#e08b00", zorder=5)
+        ax.annotate(f"m={max(mo['m'], mo['n'])}\n{mo['theta_air_deg']:.1f}$^\\circ$"
+                    f"$\\to${mo['theta_org_deg']:.1f}$^\\circ$",
+                    (mo["theta_air_deg"], mo["theta_org_deg"]),
+                    textcoords="offset points", xytext=(6, -22), fontsize=8)
+    for mo in sup:
+        ax.plot([mo["theta_air_deg"]], [mo["theta_org_deg"]], "x", ms=9,
+                color="#b00020", mew=2, zorder=5)
+    ax.set_xlim(0, 90)
+    ax.set_ylim(0, max(90.0 / 3.0, crit * 1.35))
+    ax.set_xlabel(r"free-space emission angle  $\theta_{air}$  (deg)")
+    ax.set_ylabel(r"matching angle inside the EML  $\theta_{EML}$  (deg)")
+    ax.set_title("angle mapping: what the design actually has to steer")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="upper left")
+
+    # Same information as momentum, which is where the orders are evenly spaced.
+    ax2.axhline(1.0, color="#b00020", ls="--", lw=1.4, label="air light line  u=1")
+    ax2.axhline(n, color="#444", ls=":", lw=1.4, label=f"$n_{{org}}$={n:.3f}")
+    ax2.fill_between([-0.5, len(tgt) - 0.5], 1.0, n, color="#b00020", alpha=0.07)
+    ax2.text(len(tgt) / 2.0 - 0.5, (1.0 + n) / 2.0, "trapped\n(waveguide / SPP)",
+             ha="center", va="center", fontsize=9, color="#b00020")
+    for k, mo in enumerate(tgt):
+        ax2.plot([k], [mo["u"]], "o", ms=8, color="#e08b00", zorder=5)
+        ax2.annotate(f"({mo['m']},{mo['n']})\nu={mo['u']:.3f}", (k, mo["u"]),
+                     textcoords="offset points", xytext=(0, 9), fontsize=7.5,
+                     ha="center", linespacing=1.15)
+    ax2.set_xticks(range(len(tgt)))
+    ax2.set_xticklabels([f"{m['theta_air_deg']:.0f}$^\\circ$\n$\\phi$={m['phi_deg']:.0f}"
+                         for m in tgt], fontsize=8)
+    ax2.set_ylim(0, n * 1.08)
+    ax2.set_xlim(-0.5, len(tgt) - 0.5)
+    ax2.set_ylabel(r"in-plane momentum  $u=k_\parallel/k_0$")
+    ax2.set_title(f"targets in momentum, pitch {PERIOD:.4f} $\\mu$m "
+                  f"($\\lambda/P$={LAM / PERIOD:.4f})")
+    ax2.grid(True, alpha=0.3, axis="y")
+    ax2.legend(fontsize=8, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] angle mapping -> {path}")
+
+
+def plot_iteration_state(rho, purities, level, match, it, path=None, beta=None,
+                         fom=float("nan"), trial=False):
+    """Structure and per-order purity side by side, once per iteration.
+
+    Plotted together on purpose: the question being asked of every iteration is
+    which feature of the structure is feeding which order, and that is unreadable
+    from either panel alone.
+    """
+    # One rolling file, overwritten each iteration -- the iteration number lives in
+    # the title, not in a pile of filenames.
+    path = path or os.path.join(G.design_dir, "OLED_rec_current.png")
     try:
-        oc.run_postprocess(G, np.zeros(int(np.prod(G.design_grids)), float), mapping=None)
-    finally:
-        os.environ.pop("MSOPT_OLED_PP_PLANAR", None)
-        os.environ.pop("MSOPT_OLED_PP_DIPOLE_GRID", None)
-    if oc.load_planar_reference_curve(identity=ident)[0] is None:
-        raise RuntimeError(
-            "the planar measurement did not produce a matching reference "
-            f"({ident}). Set MSOPT_OLED_REQUIRE_PLANAR_REF=0 to optimize without "
-            "the overlay, or investigate before spending GPU hours."
-        )
-    print("[planar] reference written; continuing to the optimization")
+        # oled_common.design_to_grid already accepts all three input sizes OPT_Ms
+        # can hand over -- the full voxel vector, the mapped-parameter vector, or an
+        # Nx*Ny sheet -- so use it instead of calling mapping() again. Doing that by
+        # hand is what fed 204304 values to a radial map wanting its 912 parameters
+        # ("cannot reshape array of size 204304 into shape (57,16)").
+        vol = oc.design_to_grid(G, np.asarray(rho, float).ravel(), mapping)
+    except Exception as exc:                          # never kill a run over a plot
+        print(f"[plot] structure panel skipped: {exc}")
+        vol = None
+
+    tgt = [(k, mo) for k, mo in enumerate(target_modes) if not mo["suppress"]]
+    # Column 2 is three stacked x-z cross-sections instead of one panel. The
+    # earlier x-z-at-y=0 / y-z-at-x=0 pairing was redundant -- Sym_geo_C8
+    # imposes D4/C4v (fliplr + flipud + transpose), so those two cuts are
+    # identical by construction -- so this instead shows the SAME kind of cut
+    # (x-z, i.e. constant y) at three different y, which is actually new
+    # information: how the profile changes moving across the cell.
+    #
+    # The design region is wide and thin (period ~um across, a fraction of
+    # that tall), so an aspect="equal" cut wants to render far wider than one
+    # unit-width column can hold -- aspect="auto" (the original choice) fills
+    # the column but draws the cross-section at the WRONG aspect ratio
+    # instead, which is the actual bug being fixed here. Sizing the column
+    # from the real x:z ratio (rather than guessing a fixed width_ratio) is
+    # what stops the aspect-correct image (and its colorbar) from spilling
+    # into column 3 -- the failure mode the first attempt at this had, at a
+    # column width picked before checking whether it was wide enough.
+    aspect_xz = float(G.design_s[0]) / max(float(G.design_s[2]), 1e-9)
+    BASE_COL_W = 4.6            # approx. inches one width_ratio=1.0 unit renders at
+    row_h_est = 3.3 / 3.0       # rough usable plot height per row, inches
+    col2_ratio = max(row_h_est * aspect_xz / BASE_COL_W, 1.0)
+    width_ratios = [1.0, col2_ratio, 1.05, 1.2]
+    fig = plt.figure(figsize=(BASE_COL_W * sum(width_ratios), 4.6))
+    outer_gs = fig.add_gridspec(1, 4, width_ratios=width_ratios)
+    a1 = fig.add_subplot(outer_gs[0, 0])
+    # A narrow SECOND inner column holds one colorbar axis spanning all three
+    # rows -- carved from the same subgridspec as the image axes, so it is
+    # guaranteed to stay inside column 2's own bounds instead of relying on
+    # fig.colorbar's automatic ax-shrinking (matplotlib's make_axes), which is
+    # what let the previous version's colorbar drift past the column boundary.
+    inner_gs = outer_gs[0, 1].subgridspec(3, 2, width_ratios=[1.0, 0.05],
+                                          hspace=0.75, wspace=0.25)
+    a1b = fig.add_subplot(inner_gs[0, 0])
+    a1c = fig.add_subplot(inner_gs[1, 0])
+    a1d = fig.add_subplot(inner_gs[2, 0])
+    cax = fig.add_subplot(inner_gs[:, 1])
+    a2 = fig.add_subplot(outer_gs[0, 2])
+    a3 = fig.add_subplot(outer_gs[0, 3])
+    # Same sections oled_common.save_current_design_sections uses, and the same
+    # binary colormap: a z-averaged single panel hid whether the design had actually
+    # binarized or was still grey, and hid any z structure entirely.
+    if vol is not None:
+        Nx, Ny, Nz = G.design_grids
+        xa = np.linspace(-0.5 * G.design_s[0], 0.5 * G.design_s[0], Nx)
+        ya = np.linspace(-0.5 * G.design_s[1], 0.5 * G.design_s[1], Ny)
+        za = np.linspace(G.design_c[2] - 0.5 * G.design_s[2],
+                         G.design_c[2] + 0.5 * G.design_s[2], Nz)
+        gray = float(np.mean((vol > 1e-3) & (vol < 1 - 1e-3)))
+        a1.imshow(vol[:, :, Nz // 2].T, origin="lower", cmap="binary",
+                  extent=(xa[0], xa[-1], ya[0], ya[-1]), vmin=0.0, vmax=1.0,
+                  aspect="equal", interpolation="nearest")
+        a1.set_ylabel(r"y ($\mu$m)")
+        a1.set_title(f"x-y at z=center   grey {gray*100:.1f}%")
+
+        y_max = float(ya[-1])
+        rows = [(a1b, 0.8 * y_max, r"0.8\,y_{max}"),
+                (a1c, 0.5 * y_max, r"0.5\,y_{max}"),
+                (a1d, 0.0, r"0")]
+        im = None
+        for ax, y_target, y_lbl in rows:
+            iy = int(np.argmin(np.abs(ya - y_target)))
+            im = ax.imshow(vol[:, iy, :].T, origin="lower", cmap="binary",
+                           extent=(xa[0], xa[-1], za[0], za[-1]), vmin=0.0, vmax=1.0,
+                           aspect="equal", interpolation="nearest")
+            ax.set_ylabel(r"z ($\mu$m)")
+            ax.set_title(f"x-z at $y={y_lbl}={ya[iy]:.3f}\\,\\mu$m", fontsize=9)
+        fig.colorbar(im, cax=cax, label=r"$\rho$")
+    a1.set_xlabel(r"x ($\mu$m)")
+    a1d.set_xlabel(r"x ($\mu$m)")
+
+    got = np.array([purities[k] for k, _mo in tgt], dtype=float)
+    want = np.array([target_modes[k]["weight"] for k, _mo in tgt], dtype=float)
+    want = want / max(want.sum(), 1e-30) * max(got.sum(), 1e-30)   # same total
+    x = np.arange(len(tgt))
+    a2.bar(x - 0.2, got, 0.4, color="#1f4e79", label="achieved")
+    a2.bar(x + 0.2, want, 0.4, color="#e08b00", alpha=0.85,
+           label="requested ratio (rescaled to the same total)")
+    a2.set_xticks(x)
+    a2.set_xticklabels([f"{mo['theta_air_deg']:.0f}$^\\circ$\n({mo['m']},{mo['n']})"
+                        for _k, mo in tgt], fontsize=8)
+    a2.set_ylabel("modal coupling  $a_i$" if MODAL_METRIC == "absolute" else "modal purity  $p_i$")
+    a2.set_title(f"order {'coupling' if MODAL_METRIC == 'absolute' else 'purity'}   "
+                 f"$\\Sigma$={got.sum():.4f}   level={level:.3f}   match={match:.3f}")
+    a2.grid(True, alpha=0.3, axis="y")
+    a2.legend(fontsize=8)
+
+    # Third panel: the trend. FoM, level and match are ALL bounded to [0,1] now
+    # (see level_score / match_J), so they share one axis instead of the old
+    # FoM-vs-twin-axis-T*S split, which needed two scales because raw T*S was
+    # not bounded. Trial points (msopt's line search) are marked apart from
+    # accepted ones, because a run that looks like it is going backwards is
+    # usually just showing the rejected probes alongside the accepted steps.
+    if _FOM_TRACE:
+        idx = np.array([r[0] for r in _FOM_TRACE], float)
+        f = np.array([r[1] for r in _FOM_TRACE], float)
+        lv = np.array([r[2] for r in _FOM_TRACE], float)
+        mt = np.array([r[3] for r in _FOM_TRACE], float)
+        a3.plot(idx, f, "-o", ms=4.5, color="#1f4e79", lw=1.6, label="FoM")
+        a3.plot(idx, mt, "-", color="#7a4a00", lw=1.2, alpha=0.85, label="match")
+        a3.plot(idx, lv, "-", color="#e08b00", lw=1.2, alpha=0.85, label="level")
+        a3.axhline(f.max(), color="#2e7d32", ls="--", lw=1.0,
+                   label=f"best FoM {f.max():.4f}")
+        a3.set_xlabel("msopt iteration")
+        a3.set_ylabel("score (all bounded 0-1)")
+        a3.set_ylim(-0.02, 1.05)
+        a3.set_title("FoM / match / level history (accepted steps)")
+        a3.grid(True, alpha=0.3)
+        a3.legend(fontsize=7.5, loc="lower right")
+
+    fig.suptitle(f"OLED_rec  --  iteration {it}"
+                 f"{'  (line-search trial)' if trial else ''}   "
+                 f"FoM={fom:.4f}   level={level:.3f}   match={match:.3f}", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def iter_plot(state):
+    """Per-iteration record of which mode is carrying the score."""
+    hist = state.get("history") or []
+    if not hist:
+        return
+    arr = np.asarray(hist, dtype=float)
+    fig, ax = plt.subplots(figsize=(8.0, 4.2))
+    for k, s in enumerate(OBJ_SPECS):
+        if k >= arr.shape[1]:
+            break
+        if s["kind"] == "trans":
+            ax.plot(arr[:, k], lw=2.0, color="k",
+                    label=f"captured level, weighted (_ST={_ST:.2f})")
+            continue
+        if s["kind"] == "match":
+            ax.plot(arr[:, k], lw=2.0, color="#7a4a00",
+                    label=f"distribution match, weighted (_SM={_SM:.2f}, "
+                          f"{len(s['idx'])} order(s))")
+            continue
+        lead = target_modes[s["idx"][0]]
+        lbl = (f"SUPPRESS >{TARGET_MAX_ANGLE:g} deg ({len(s['idx'])} order(s))"
+               if s["kind"] == "suppress" else
+               f"{lead['theta_air_deg']:g} deg air / {lead['theta_org_deg']:.1f} deg EML "
+               f"(m,n)=({lead['m']},{lead['n']})")
+        ax.plot(arr[:, k], lw=1.4, ls="--" if s["kind"] == "suppress" else "-",
+                label=lbl)
+    ax.plot(arr.sum(axis=1), "k--", lw=1.8, label="total FoM")
+    ax.set_xlabel("FoM evaluation")
+    ax.set_ylabel("per-objective score (weighted contribution)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    ax.set_title(f"OLED_rec: EML momentum content, pitch {PERIOD:g} um, pol {SOURCE_POL}")
+    fig.tight_layout()
+    fig.savefig(os.path.join(G.design_dir, "OLED_rec_mode_history.png"), dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -1891,8 +2002,6 @@ def main():
                                "MSOPT_OLED_POSTPROCESS_ONLY=1")
         plot_kmap_geometry()
         plot_angle_mapping()
-        # The postprocess overlay's reference, before anything expensive starts.
-        ensure_planar_reference()
         # Empty-domain reference BEFORE build_problem: the transmission term is
         # measured against it so it has to exist before any FoM is evaluated, and
         # running it first means its Lumerical session is opened and closed while
@@ -1908,17 +2017,6 @@ def main():
         optimizer = ms.Opt_MS2.OPT_Ms(
             x0, dJ_0, design_dir=G.design_dir, local_best_dir=G.local_dir,
             Born_k=90, Initial_LR=oc.env_float("MSOPT_OLED_INITIAL_LR", 0.2),
-            # Filterless designs have no projection-driven snap; see Opt_MS2.
-            # FREEFORM ONLY. 1.5 when there is no filter, 1.0 (unchanged) with one:
-            # the filtered path already gets its sharpening from the
-            # filter+projection schedule -- it jumped match 0.2 -> 0.5
-            # in 3 evaluations while freeform crawled the same span over ~90 --
-            # so raising it there would change a path that already works.
-            # so it starts projection sharper. Deliberately under 2.0, which is
-            # where Opt_MS2 switches mapping branches: this buys the sharpening
-            # without also changing the code path being measured.
-            Initial_beta=oc.env_float("MSOPT_OLED_INITIAL_BETA",
-                                      1.0 if USE_MFS_FILTER else 1.5),
             # Raw=True sets Armijo_cond = -1, so `f0 < Armijo_cond` can never fire
             # on a positive FoM and the backtracking line search is dead: a step
             # that makes the FoM worse is simply kept. Observed here as every

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pwd
 import re
 import subprocess
 import time
@@ -50,6 +51,14 @@ class GpuJob:
     process_name: str
     used_memory_mib: int
     task_name: str
+    start_time: float | None = None
+    owner: str | None = None
+
+    @property
+    def elapsed_seconds(self) -> float | None:
+        if self.start_time is None:
+            return None
+        return max(time.time() - self.start_time, 0.0)
 
 
 @dataclass
@@ -172,40 +181,299 @@ def _proc_environ(pid: int) -> dict[str, str]:
     return env
 
 
-def _parent_pids(pid: int, limit: int = 8) -> list[int]:
-    pids = [pid]
-    if psutil is None:
-        return pids
+def _proc_start_time(pid: int) -> float | None:
+    """Epoch seconds when the process started, or None if it cannot be read."""
+    if psutil is not None:
+        try:
+            return float(psutil.Process(pid).create_time())
+        except Exception:
+            pass
     try:
-        proc = psutil.Process(pid)
-        for _ in range(limit):
-            parent = proc.parent()
-            if parent is None:
-                break
-            pids.append(parent.pid)
-            proc = parent
-    except Exception:
-        pass
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read().decode(errors="replace")
+        with open("/proc/uptime", "rb") as handle:
+            uptime = float(handle.read().split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+    # Field 22 (starttime) is counted after the comm field, which may contain spaces.
+    close = stat.rfind(")")
+    if close < 0:
+        return None
+    fields = stat[close + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        ticks = float(fields[19])
+    except ValueError:
+        return None
+    clk_tck = os.sysconf("SC_CLK_TCK") or 100
+    return (time.time() - uptime) + ticks / clk_tck
+
+
+def _format_elapsed(seconds: float | None) -> str:
+    if seconds is None:
+        return "t = unknown"
+    total_minutes = int(seconds // 60)
+    return f"t = {total_minutes // 60}h {total_minutes % 60}min"
+
+
+def _ppid(pid: int) -> int | None:
+    """Parent pid straight from /proc, readable even for another user's process."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read().decode(errors="replace")
+    except OSError:
+        return None
+    close = stat.rfind(")")
+    if close < 0:
+        return None
+    fields = stat[close + 2 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def _parent_pids(pid: int, limit: int = 12) -> list[int]:
+    pids = [pid]
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+            for _ in range(limit):
+                parent = proc.parent()
+                if parent is None:
+                    break
+                pids.append(parent.pid)
+                proc = parent
+            return pids
+        except Exception:
+            pids = [pid]
+    current = pid
+    for _ in range(limit):
+        parent = _ppid(current)
+        if parent is None or parent <= 1:
+            break
+        pids.append(parent)
+        current = parent
     return pids
 
 
-def _task_name_for_pid(pid: int, process_name: str) -> str:
-    for candidate_pid in _parent_pids(pid):
+SCRIPT_SUFFIXES = (".py", ".sh")
+
+
+def _script_arg(cmdline: list[str]) -> str | None:
+    for arg in cmdline:
+        if arg.endswith(SCRIPT_SUFFIXES):
+            return arg
+    return None
+
+
+def _command_label(cmdline: list[str]) -> str | None:
+    """The command's own name, skipping the interpreter and its option flags."""
+    for arg in cmdline:
+        if not arg or arg.startswith("-"):
+            continue
+        base = os.path.basename(arg)
+        if not base or "python" in base.lower():
+            continue
+        return base
+    return None
+
+
+PROJECT_SUFFIXES = (".fsp", ".lms", ".ldev", ".icp")
+
+
+def _project_arg(cmdline: list[str]) -> str | None:
+    for arg in cmdline:
+        if arg.endswith(PROJECT_SUFFIXES):
+            return arg
+    return None
+
+
+def _abs_path(path: str, pid: int) -> str | None:
+    if os.path.isabs(path):
+        return path
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")  # readable only for own processes
+    except OSError:
+        return None
+    return os.path.join(cwd, path)
+
+
+_script_search_cache: dict[tuple[str, str], str | None] = {}
+
+SEARCH_MAX_DEPTH = 5
+SEARCH_SKIP_DIRS = frozenset(
+    {
+        "miniconda3",
+        "anaconda3",
+        "node_modules",
+        "site-packages",
+        "__pycache__",
+        "venv",
+        "envs",
+        "build",
+        "dist",
+        "lost+found",
+    }
+)
+
+
+def _search_roots(owner: str | None) -> list[str]:
+    """Where a job's code plausibly lives, most specific first.
+
+    A ramdisk copy is what actually runs when one exists, so /dev/shm is
+    searched before the source tree it was copied from.  Personal accounts
+    are skipped: /home/<user> only ever yields the user name, which the uid
+    already gives -- the shared account is the one that hides who is running.
+    """
+    roots = ["/dev/shm"]
+    if owner == SHARED_ACCOUNT:
+        roots += [f"/home/{owner}", f"/data/{owner}"]
+    return [root for root in roots if os.path.isdir(root)]
+
+
+def _find_script_path(script: str, owner: str | None) -> str | None:
+    """Locate a relative script when its process's cwd is unreadable.
+
+    /proc/<pid>/cwd is owner-only, so another user's job hides where it runs
+    from -- but the directories themselves are world-readable, so the script
+    name can be searched under the places that account runs from.  Only an
+    unambiguous answer is trusted: hits that disagree on the owner folder
+    could label the job as the wrong person, so they are all discarded.
+    """
+    base = os.path.basename(script)
+    if not base:
+        return None
+    key = (owner or "", base)
+    if key in _script_search_cache:
+        return _script_search_cache[key]
+    result = None
+    for root in _search_roots(owner):
+        hits: dict[str, str] = {}
+        base_depth = root.rstrip("/").count(os.sep)
+        for current, dirs, files in os.walk(root, onerror=None):
+            if current.count(os.sep) - base_depth >= SEARCH_MAX_DEPTH:
+                dirs[:] = []
+            else:
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if not name.startswith(".") and name not in SEARCH_SKIP_DIRS
+                ]
+            if base in files:
+                path = os.path.join(current, base)
+                label = _owner_folder(path)
+                if label:
+                    hits[label] = path
+                    if len(hits) > 1:
+                        break
+        if len(hits) == 1:
+            result = next(iter(hits.values()))
+            break
+    _script_search_cache[key] = result
+    return result
+
+
+SHARED_ACCOUNT = "eidl"
+USER_ROOTS = ("home", "data")
+
+
+def _owner_folder(path: str | None) -> str | None:
+    """Whose folder the task runs from: /home/<name>, /data/<name>, or a /dev/shm dir.
+
+    eidl is the shared account, so under it the folder below is the label.
+    """
+    if not path or not path.startswith("/"):
+        return None
+    parts = [part for part in path.split("/") if part]
+    if not os.path.isdir(path):
+        # A file name says nothing about ownership; the folder holding it does.
+        parts = parts[:-1]
+    if len(parts) >= 3 and parts[0] == "dev" and parts[1] == "shm":
+        return parts[2]
+    if len(parts) < 2 or parts[0] not in USER_ROOTS:
+        return None
+    if parts[1] == SHARED_ACCOUNT and len(parts) >= 3:
+        return parts[2]
+    return parts[1]
+
+
+def _pid_user(pid: int) -> str | None:
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def _task_identity_for_pid(pid: int, process_name: str) -> tuple[str, int, str | None]:
+    """Task label, the pid it was resolved from, and the path that identified it."""
+    run_dir_owner: tuple[str, int] | None = None
+    script_owner: tuple[str, int] | None = None
+    candidates = _parent_pids(pid)
+    for candidate_pid in candidates:
         env = _proc_environ(candidate_pid)
         run_dir = env.get("EIDL_RUN_DIR")
         if run_dir:
-            return os.path.basename(run_dir.rstrip("/")) or run_dir
+            if run_dir_owner is not None and run_dir_owner[0] != run_dir:
+                break
+            # EIDL_RUN_DIR is inherited, so keep walking: the oldest ancestor
+            # carrying the same run dir is the study runner, not the restarted worker.
+            run_dir_owner = (run_dir, candidate_pid)
+            continue
+        if run_dir_owner is not None:
+            break
 
-        cmdline = _proc_cmdline(candidate_pid)
-        for arg in cmdline:
-            if arg.endswith(".py"):
-                return os.path.basename(arg)
-        for arg in cmdline:
-            if "python" not in os.path.basename(arg).lower() and arg:
-                base = os.path.basename(arg)
-                if base:
-                    return base
-    return process_name or "(unknown)"
+        # A script name is what identifies the task, so the whole ancestry is
+        # searched for one.  The process holding the card is often not a script
+        # at all -- fdtd-engine is a binary, restarted for every solve -- and
+        # naming it would peg elapsed to a worker minutes old inside a run that
+        # has been going for hours.  /proc/<pid>/environ is readable only by the
+        # owner, so for anyone else's job this walk is the only thing that works.
+        script = _script_arg(_proc_cmdline(candidate_pid))
+        if script:
+            script_owner = (script, candidate_pid)
+            break
+
+    if run_dir_owner is not None:
+        run_dir, owner_pid = run_dir_owner
+        name = os.path.basename(run_dir.rstrip("/")) or run_dir
+        # Run dirs all live in the shared Lumerical_data area; the runner's
+        # script path is what says whose folder the study belongs to.
+        script = _script_arg(_proc_cmdline(owner_pid))
+        label_path = _abs_path(script, owner_pid) if script else None
+        return name, owner_pid, label_path or run_dir
+
+    # The engine's command line names the project file sitting inside the run
+    # dir, and unlike environ it is readable for anyone's process -- so another
+    # user's solve still resolves to its run dir instead of a bare script name.
+    project = _project_arg(_proc_cmdline(pid))
+    if project:
+        project_path = _abs_path(project, pid)
+        if project_path:
+            run_dir_name = os.path.basename(os.path.dirname(project_path))
+            if run_dir_name:
+                owner_pid = script_owner[1] if script_owner else pid
+                return run_dir_name, owner_pid, project_path
+
+    if script_owner is not None:
+        script, owner_pid = script_owner
+        path = _abs_path(script, owner_pid) or _find_script_path(script, _pid_user(owner_pid))
+        return os.path.basename(script), owner_pid, path
+
+    # No script anywhere above the card: the process itself is all there is, and
+    # it is at least a real process with a real start time.
+    for candidate_pid in candidates:
+        label = _command_label(_proc_cmdline(candidate_pid))
+        if label:
+            return label, candidate_pid, None
+    return process_name or "(unknown)", pid, None
 
 
 def _gpu_jobs(gpus: list[GpuInfo]) -> dict[int, list[GpuJob]]:
@@ -234,13 +502,22 @@ def _gpu_jobs(gpus: list[GpuInfo]) -> dict[int, list[GpuJob]]:
         gpu_index = uuid_to_index.get(gpu_uuid)
         if gpu_index is None:
             continue
+        task_name, task_pid, task_path = _task_identity_for_pid(pid, process_name)
+        # Elapsed follows the task owner: engine workers restart per iteration, the study does not.
+        start_time = _proc_start_time(task_pid)
+        if start_time is None and task_pid != pid:
+            start_time = _proc_start_time(pid)
+        # Whose job: the /home folder the run lives in, else the process owner.
+        owner = _owner_folder(task_path) or _pid_user(task_pid) or _pid_user(pid)
         jobs.setdefault(gpu_index, []).append(
             GpuJob(
                 gpu_index=gpu_index,
                 pid=pid,
                 process_name=os.path.basename(process_name) or process_name,
                 used_memory_mib=used_memory_mib,
-                task_name=_task_name_for_pid(pid, process_name),
+                task_name=task_name,
+                start_time=start_time,
+                owner=owner,
             )
         )
     return jobs
@@ -256,15 +533,33 @@ def _allocatable_gpus(gpus: list[GpuInfo], max_util: int, min_free_mib: int) -> 
     ]
 
 
-def _job_lines(jobs: list[GpuJob] | None) -> list[str]:
+def _elapsed_width(job_lists: list[list[GpuJob] | None]) -> int:
+    """One column width for the whole report, so owner tags line up across GPUs."""
+    return max(
+        (
+            len(_format_elapsed(job.elapsed_seconds))
+            for jobs in job_lists
+            if jobs
+            for job in jobs
+        ),
+        default=0,
+    )
+
+
+def _job_lines(jobs: list[GpuJob] | None, width: int = 0) -> list[str]:
     if not jobs:
         return ["no compute jobs detected"]
+    ordered = sorted(jobs, key=lambda item: item.used_memory_mib, reverse=True)
+    elapsed = [_format_elapsed(job.elapsed_seconds) for job in ordered]
+    width = max(width, max(len(text) for text in elapsed))
     return [
         (
-            f"{job.task_name} "
+            f"{text:<{width}}  /  "
+            + (f"[{job.owner}] " if job.owner else "")
+            + f"{job.task_name} "
             f"(pid={job.pid}, proc={job.process_name}, vram={job.used_memory_mib} MiB)"
         )
-        for job in sorted(jobs, key=lambda item: item.used_memory_mib, reverse=True)
+        for text, job in zip(elapsed, ordered)
     ]
 
 
@@ -472,7 +767,19 @@ def main(argv: list[str] | None = None) -> int:
     if gpus:
         print("")
         print("GPU status")
-        for gpu in sorted(gpus, key=lambda item: item.index):
+        ordered_gpus = sorted(gpus, key=lambda item: item.index)
+        shown_jobs = {
+            gpu.index: (
+                gpu_peaks[gpu.index].peak_util_jobs
+                if gpu.index in gpu_peaks
+                else gpu_jobs.get(gpu.index, [])
+            )
+            for gpu in ordered_gpus
+        }
+        elapsed_width = _elapsed_width(list(shown_jobs.values()))
+        for position, gpu in enumerate(ordered_gpus):
+            if position:
+                print("")
             marker = "*" if gpu.index in allocatable_gpu_indices else " "
             peak = gpu_peaks.get(gpu.index)
             print(
@@ -488,13 +795,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"free={peak.peak_free_mib} MiB, samples={peak.samples}"
                 )
                 print("     jobs at peak util:")
-                for line in _job_lines(peak.peak_util_jobs):
+                for line in _job_lines(shown_jobs[gpu.index], elapsed_width):
                     print(f"       - {line}")
             else:
                 print("     peak over history: unavailable")
                 print("     current jobs:")
-                for line in _job_lines(gpu_jobs.get(gpu.index, [])):
+                for line in _job_lines(shown_jobs[gpu.index], elapsed_width):
                     print(f"       - {line}")
+        print("")
         print("  * = no compute jobs detected during the history window")
     else:
         print("")

@@ -4,6 +4,26 @@ Everything shared lives in **`oled_common.py`**: geometry/config, the layer
 stacks, Lumerical helpers, the k-space FoM basis, and the incoherent-dipole
 postprocess. The optimizers are thin scripts on top of it.
 
+
+## Current structure (2026-08-19)
+
+The application was reduced to the chain `OLED_rec` actually runs. Everything
+else moved to `legacy/`, unchanged, and is not imported by anything live.
+
+| file | role |
+|---|---|
+| `OLED_rec.py` | main optimization: FoM, adjoint loop, postprocess entry |
+| `k_mapping.py` | diffraction-order search: angle ladder, 2-D modes, minimum pitch, ramp weights |
+| `OLED_layered_dipole.py` | analytic multilayer solver; defines the microcavity stacks |
+| `OLED_stack_design.py` | stack search/optimization built on that solver |
+| `oled_common.py` | shared geometry, simulation and postprocess helpers |
+| `oled_rec_plots.py` | figures only -- no physics; configuration injected via `bind()` |
+| `test_oled_common.py`, `test_oled_layered_dipole.py` | 18 tests |
+
+`legacy/` additionally holds `oled_common_legacy.py`, the 28 helpers only the
+retired scripts used.
+
+
 ## Files
 
 | file | role |

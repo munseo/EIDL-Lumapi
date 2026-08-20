@@ -1375,6 +1375,7 @@ class LumericalOptimizationProblem:
         opt_idx=0,
         broadband_adjoint=False,
         Incoherent=False,
+        Multiobj="sum",
     ):
         self.sim = sim
         self.objective_functions = objective_functions
@@ -1396,6 +1397,19 @@ class LumericalOptimizationProblem:
         # order J1_lam1, J1_lam2, ..., JN_lam1, ... -- the existing broadband
         # machinery is reused unchanged inside each objective.
         self.Incoherent = bool(Incoherent)
+        # HOW THE PER-OBJECTIVE GRADIENTS ARE COMBINED (Incoherent=True only).
+        #   "sum"     g = sum_j g_j. Maximizes the SUM of the objectives, so it
+        #             needs the caller to have picked a weight per objective --
+        #             and a weighted sum of competing objectives is a linear
+        #             program in the trade-off, whose optimum sits at a vertex:
+        #             it happily starves one objective to feed another.
+        #   "minimax" g = mean of the g_j whose f0_j is BELOW the mean f0
+        #             (Opt_MS2.Minimax). Maximizes the WORST objective, so no
+        #             objective can be traded away, and no relative weights are
+        #             required. The objectives must therefore be COMMENSURATE:
+        #             each on its own [0, 1] scale with 1 = "satisfied", or the
+        #             below-mean test compares apples to oranges.
+        self.Multiobj = str(Multiobj).lower()
         self.adjoint_fields_per_J = []
         self.f0_per_J = []
         self.gradient_per_J = []
@@ -2045,7 +2059,30 @@ class LumericalOptimizationProblem:
               f"order J1_lam1..J1_lam{nlam}, ..., J{nJ}_lam{nlam}")
         self.adjoint_fields_per_J = []
         self.f0_per_J = [float(np.real(np.sum(J(*args)))) for J in self.objective_functions]
+
+        # MINIMAX PRE-SELECTION. f0_per_J comes from the FORWARD fields alone, and
+        # minimax's rule (f_j <= mean) reads nothing else -- so the driving set is
+        # already known before a single adjoint runs. Deciding first and skipping
+        # the rest is not an approximation: the skipped gradients were computed and
+        # then thrown away by Opt_MS2.Minimax anyway, so the resulting gradient is
+        # bit-identical and only the FDTD cost changes. Measured on the OLED_rec
+        # freeform runs, 3 objectives with only J2 below the mean: 3 adjoints at
+        # ~11-13 s each became 1, about 24 s saved per gradient iteration.
+        drive = list(range(nJ))
+        if getattr(self, "Multiobj", "sum") == "minimax" and nJ > 1:
+            f_mean = float(np.mean(self.f0_per_J))
+            drive = [j for j, v in enumerate(self.f0_per_J) if v <= f_mean]
+            skipped = [j + 1 for j in range(nJ) if j not in drive]
+            if skipped:
+                print(f"[incoherent] minimax pre-select: adjoint for "
+                      f"J{[j + 1 for j in drive]}, skipping J{skipped} "
+                      f"(above mean {f_mean:.6e}; their gradients would be discarded)")
+
         for jobj, J in enumerate(self.objective_functions):
+            if jobj not in drive:
+                self.adjoint_fields_per_J.append(None)   # index stays aligned with f0_per_J
+                print(f"[incoherent] J{jobj + 1}: f0={self.f0_per_J[jobj]:.6e}, adjoint SKIPPED")
+                continue
             t0 = time.time()
             Fields = self._dJ_fields(J, args)
             self.adjoint_fields_per_J.append(self._run_adjoint_for_fields(Fields))
@@ -2053,7 +2090,8 @@ class LumericalOptimizationProblem:
                   f"adjoint {time.time() - t0:.2f} s")
         # keep the summed field so anything downstream that still reads
         # self.adjoint_fields sees the coherent-equivalent result
-        self.adjoint_fields = np.sum(np.asarray(self.adjoint_fields_per_J), axis=0)
+        _ran = [a for a in self.adjoint_fields_per_J if a is not None]
+        self.adjoint_fields = np.sum(np.asarray(_ran), axis=0)
         self.current_state = "Adj"
         print(f"[incoherent] total adjoint time: {time.time() - start:.2f} s")
 
@@ -2135,15 +2173,35 @@ class LumericalOptimizationProblem:
             self.gradient_per_J, total = [], None
             try:
                 for jobj, adj_j in enumerate(self.adjoint_fields_per_J):
+                    if adj_j is None:            # pre-selected away, see above
+                        self.gradient_per_J.append(None)
+                        continue
                     self.adjoint_fields = adj_j
                     g_j = np.asarray(self._calculate_gradient_single(debug_mode), dtype=float)
                     self.gradient_per_J.append(g_j)
                     total = g_j.copy() if total is None else total + g_j
                     print(f"[incoherent] J{jobj + 1} |grad|={np.linalg.norm(g_j):.6e}")
+                if total is None:
+                    raise RuntimeError("no adjoint gradient survived pre-selection")
             finally:
                 self.adjoint_fields = saved
+            how = "summed"
+            if self.Multiobj == "minimax" and len(self.gradient_per_J) > 1:
+                f0s = list(getattr(self, "f0_per_J", []) or [])
+                ran = [(i, g) for i, g in enumerate(self.gradient_per_J) if g is not None]
+                if len(f0s) == len(self.gradient_per_J) and ran:
+                    # Only the below-average objectives steer, so the step improves
+                    # the WORST one -- see Multiobj in __init__. The pre-selection
+                    # in adjoint_dipole_run_incoherent already ran adjoints for
+                    # exactly that set, so averaging what came back IS Minimax; the
+                    # None entries are the ones it would have zero-weighted anyway.
+                    total = sum(g for _, g in ran) / float(len(ran))
+                    how = f"minimax(driving J{[i + 1 for i, _ in ran]})"
+                else:
+                    print(f"[incoherent] minimax skipped: {len(f0s)} f0 vs "
+                          f"{len(self.gradient_per_J)} gradients; summing instead")
             self.gradient = np.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
-            print(f"[incoherent] summed |grad|={np.linalg.norm(self.gradient):.6e} "
+            print(f"[incoherent] {how} |grad|={np.linalg.norm(self.gradient):.6e} "
                   f"over {len(self.gradient_per_J)} objective(s)")
             self.current_state = "INIT"
             return self.gradient.flatten()

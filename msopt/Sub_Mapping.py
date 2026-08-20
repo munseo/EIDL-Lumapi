@@ -216,6 +216,29 @@ def radial_cross_section_to_3d(
 
 The code was optimized for X: heights, Y: width, Z: length (propagation axis)
 """
+def apply_c8_symmetry_2d(x_ref):
+    """Apply the D4/C4v-style C8 averaging used by the freeform mapping.
+
+    This is intentionally applied per 2D layer. The symmetry is done on each
+    independent layer and does not mix different z-layers together.
+    """
+    x_ref = npa.asarray(x_ref)
+    x_ref = (npa.fliplr(x_ref) + x_ref) / 2
+    x_ref = (npa.flipud(x_ref) + x_ref) / 2
+    x_ref = (x_ref.transpose() + x_ref) / 2
+    return x_ref
+
+
+def apply_c8_symmetry_per_layer(x):
+    """Apply the same C8 averaging to every z-layer independently."""
+    x_arr = npa.asarray(x)
+    if x_arr.ndim == 2:
+        return apply_c8_symmetry_2d(x_arr)
+    if x_arr.ndim == 3:
+        return npa.stack([apply_c8_symmetry_2d(layer) for layer in x_arr], axis=0)
+    raise ValueError(f"expected 2D or 3D layer data, got shape {x_arr.shape}")
+
+
 def apply_grbg_cell_symmetry(x, N_width, N_length, cell_gap=0):
     """
     Apply GRBG symmetry logic to the entire 2D design array.
@@ -438,9 +461,7 @@ def get_reference_layer(#-- Input parameters ---------------------|
         #x_ref = (npa.rot90(x_ref,2).transpose()+ x_ref)/2                                   #   off diag             |
         x_ref = (x_ref.transpose()+ x_ref)/2                                                 #   diag                 |
     if Pseudo_Cyl:
-        x_ref = (npa.fliplr(x_ref) + x_ref)/2
-        x_ref = (npa.flipud(x_ref) + x_ref)/2
-        x_ref = (x_ref.transpose() + x_ref)/2
+        x_ref = apply_c8_symmetry_2d(x_ref)
     x_ref = x_ref.flatten()
     #-----------------------------------------------------------------------------------------------------------------|
     x_copy = tanh_projection_m(x_ref, beta, 0.5)                                            # Binarization ----------|

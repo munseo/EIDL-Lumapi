@@ -6,7 +6,9 @@ from unittest import mock
 
 import numpy as np
 
+import msopt as ms
 import oled_common as oc
+import msopt.Sub_Mapping as sm
 
 
 class OledPerformanceMetricTests(unittest.TestCase):
@@ -72,6 +74,34 @@ class OledPerformanceMetricTests(unittest.TestCase):
         )
         # Unit radial intensity integrated over an upper hemisphere is 2*pi.
         self.assertAlmostEqual(float(np.sum(power)) / (2.0 * np.pi), 1.0, delta=0.02)
+
+
+class MappingDimensionTests(unittest.TestCase):
+    def test_freeform_mapping_sets_grid_dimensions(self):
+        mapping = ms.Opt_MS2.Mapping(
+            DR_info=[1.0, 1.0, 0.2, 0, 1, 2],
+            DR_N_info=[10, 12, 6, 5],
+            Mask_info=[0.0, 0.0],
+            Is_waveguide=[False, False, False, 2],
+            Is_freeform=[True, False, False],
+            Is_radial_3d=False,
+        )
+        self.assertEqual(mapping.DR_width, 1.0)
+        self.assertEqual(mapping.N_width, 10)
+        self.assertEqual(mapping.DR_length, 1.0)
+        self.assertEqual(mapping.N_length, 12)
+        self.assertEqual(mapping.N_height, 6)
+
+
+class LayerwiseSymmetryTests(unittest.TestCase):
+    def test_c8_symmetry_is_applied_per_layer(self):
+        layer0 = np.arange(16, dtype=float).reshape(4, 4)
+        layer1 = np.arange(16, dtype=float).reshape(4, 4) + 100.0
+        x = np.stack([layer0, layer1], axis=0)
+        sym = sm.apply_c8_symmetry_per_layer(x)
+        self.assertEqual(sym.shape, x.shape)
+        np.testing.assert_allclose(sym[0], sm.apply_c8_symmetry_2d(layer0))
+        np.testing.assert_allclose(sym[1], sm.apply_c8_symmetry_2d(layer1))
 
 
 class OledPostprocessCompletenessTests(unittest.TestCase):
