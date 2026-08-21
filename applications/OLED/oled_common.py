@@ -334,6 +334,11 @@ def build_config(period_x_default=2.5, period_y_default=None, seed=240,
     background_index = env_float("MSOPT_OLED_BACKGROUND_INDEX", 1.0)
     grating_initial_density = env_float("MSOPT_OLED_INITIAL_DENSITY", 0.5)
 
+    # Bloch. It was briefly suspected of causing the 2026-08-20 divergences and
+    # cleared by measurement: with the bottom air margin fixed, three identical
+    # Bloch runs all finished stable at auto-shutoff 0.0106, against 0.0086 for
+    # Periodic. The real cause was the stack ending inside the PML -- see the
+    # bottom-air guard below. Bloch is kept because an oblique probe needs it.
     boundary_mode = os.environ.get("MSOPT_OLED_BOUNDARY_MODE", "Bloch").strip().upper()
     if boundary_mode not in ("PML", "BLOCH", "PERIODIC"):
         raise ValueError("MSOPT_OLED_BOUNDARY_MODE must be PML, Bloch, or Periodic.")
@@ -369,7 +374,21 @@ def build_config(period_x_default=2.5, period_y_default=None, seed=240,
     eml_h = env_float("MSOPT_OLED_EML_UM", 0.2)
     tpbi_h = env_float("MSOPT_OLED_TPBI_UM", 0.2)
     ag_h = env_float("MSOPT_OLED_AG_UM", 0.2)
-    air_bot_h = env_float("MSOPT_OLED_AIR_BOT_UM", 0.10)
+    # The bottom needed the SAME guard the top margin has had all along, and not
+    # having it cost two full optimizations. At the old 0.10 um default the
+    # 100 nm Ag anode ended 60 nm INSIDE the PML (0.16 um at 8 layers, 50/um):
+    # a metal terminating inside the absorber is a textbook PML instability, and
+    # on 2026-08-20 every forward and adjoint run diverged from it -- decaying
+    # normally to 5e-3, then reversing and growing to ~1e5 before the solver
+    # killed it. Nothing reached the driver log. Moving the floor to 0.35 um
+    # (measured stable) fixed it; the max() below makes an explicit smaller value
+    # impossible rather than merely inadvisable.
+    air_bot_req = env_float("MSOPT_OLED_AIR_BOT_UM", 0.35)
+    air_bot_h = max(air_bot_req, pml_um + 2.0 / resolution)
+    if air_bot_h > air_bot_req + 1e-12:
+        print(f"[geometry] bottom air raised {air_bot_req * 1000:.0f} -> "
+              f"{air_bot_h * 1000:.0f} nm so the stack clears the PML "
+              f"({pml_um * 1000:.0f} nm at resolution {resolution}/um)")
 
     Sx, Sy = window_x, window_y
     Sz = air_bot_h + ag_h + tpbi_h + eml_h + tcta_h + ito_h + grating_design_h + sio2_h + air_top_h
@@ -509,7 +528,7 @@ def build_config(period_x_default=2.5, period_y_default=None, seed=240,
     # (half-width >= h * tan(angle)). Cell count scales with it -- watch the cost.
     pp_far_z_um = env_float("MSOPT_OLED_PP_FAR_Z_UM", 2.0)
     pp_max_angle_deg = env_float("MSOPT_OLED_PP_MAX_ANGLE_DEG", 60.0)
-    pp_min_tiles = env_int("MSOPT_OLED_PP_MIN_TILES", 3)
+    pp_min_tiles = env_int("MSOPT_OLED_PP_MIN_TILES", 5)
     pp_resolution = env_int("MSOPT_OLED_PP_RESOLUTION", resolution)
 
     active_radius = 0.5 * min(active_x, active_y)
@@ -619,7 +638,7 @@ def delete_object(fdtd, name):
 
 
 def make_sim(G, size, bc_x=None, bc_y=None, res=None):
-    return ms.Lumerical_utill.LumericalFDTDSimulator(
+    sim = ms.Lumerical_utill.LumericalFDTDSimulator(
         sim_size=size,
         resolution=int(res or G.resolution),
         unit=1e-6,
@@ -630,6 +649,76 @@ def make_sim(G, size, bc_x=None, bc_y=None, res=None):
         bc_y=G.bc_xy if bc_y is None else bc_y,
         bc_z="PML",
     )
+    # Courant margin. Lumerical runs at 0.99 of the stability limit by default,
+    # which is fine until something rings long enough for a per-step growth of a
+    # part in 1e5 to matter. MICROCAVITY_ONAXIS does exactly that: its
+    # postprocess cases never reach auto-shutoff at all and then blow up to
+    # 2.5e4-9.6e4, while five separate structural fixes (cathode thickness, CPL
+    # index, finer z mesh, 0.4 and 0.8 um of lateral pad) changed nothing. The
+    # z-mesh result is the tell -- halving dz doubles the step count for the same
+    # physical time and made it WORSE, which is the signature of growth per STEP
+    # rather than under-resolution.
+    #
+    # Lowering the factor costs proportionally more steps, so leave it alone
+    # unless a run is actually unstable.
+    # PML depth and profile. Nothing was setting either, so every run used
+    # Lumerical's 8 layers on the standard profile -- and MSOPT_OLED_PML_LAYERS
+    # already fed the geometry margins, so asking for 16 would have moved the
+    # structure away from a PML that was still 8 deep.
+    #
+    # These are the knobs that matter for what is happening here. A PML is
+    # derived for PROPAGATING radiation; guided and surface-bound modes are
+    # outside that derivation, and this stack is two silver mirrors around an
+    # organic waveguide, which makes plenty of them. That is the most likely
+    # reason MICROCAVITY_ONAXIS postprocess cases never reach auto-shutoff even
+    # when they do not blow up -- and why seven fixes aimed at numerical
+    # stability (mesh, Courant, thicknesses, padding, overhang) all missed.
+    # More layers give a bound mode further to attenuate in; the "stabilized"
+    # profile exists specifically for long runs that grow.
+    pml_layers = env_int("MSOPT_OLED_PML_LAYERS", 0)
+    if pml_layers > 0:
+        try:
+            sim.fdtd.setnamed("FDTD", "pml layers", int(pml_layers))
+            print(f"[FDTD] pml layers {pml_layers} (default 8)")
+        except Exception as exc:
+            print(f"[FDTD] could not set pml layers: {exc}")
+    # "stabilized" by default. A standard PML is derived for PROPAGATING
+    # radiation; this stack is two silver mirrors around an organic waveguide and
+    # is full of guided and surface-bound modes, which sit outside that
+    # derivation and can grow instead of being absorbed.
+    #
+    # Measured on MICROCAVITY_ONAXIS, whose postprocess diverged on 4 of 16
+    # dipole cases and reached auto-shutoff on NONE of them. Eleven fixes were
+    # tried; ten did nothing -- cathode thickness, CPL index, a finer z mesh
+    # (worse), 0.4 and 0.8 um of lateral pad, carrying the structure past the
+    # domain edge, Courant 0.85 and 0.70, and PML depth at 16 and 32 layers.
+    # Switching the PROFILE fixed it outright: 0 divergences, 4 of 4 converged.
+    # Depth was never the problem; the shape of the absorption was.
+    pml_profile = os.environ.get("MSOPT_OLED_PML_PROFILE", "stabilized").strip().lower()
+    if pml_profile:
+        # Lumerical takes the profile as an index; accept the names people
+        # actually say and translate, so the knob reads as documentation.
+        idx = {"standard": 1, "stabilized": 2, "steep angle": 3,
+               "steep": 3, "custom": 4}.get(pml_profile)
+        for value in ([idx] if idx else []) + [pml_profile]:
+            try:
+                sim.fdtd.setnamed("FDTD", "pml profile", value)
+                print(f"[FDTD] pml profile '{pml_profile}' (default standard)")
+                break
+            except Exception as exc:
+                last = exc
+        else:
+            print(f"[FDTD] could not set pml profile '{pml_profile}': {last}")
+
+    dt_factor = env_float("MSOPT_OLED_DT_STABILITY_FACTOR", 0.0)
+    if dt_factor > 0.0:
+        try:
+            sim.fdtd.setnamed("FDTD", "dt stability factor", float(dt_factor))
+            print(f"[FDTD] dt stability factor {dt_factor:g} "
+                  f"(default 0.99; lower trades runtime for margin)")
+        except Exception as exc:
+            print(f"[FDTD] could not set dt stability factor: {exc}")
+    return sim
 
 
 def add_stack_z_mesh_override(G, sim, span_x=None, span_y=None, z_offset=0.0):
@@ -1414,7 +1503,7 @@ def planar_reference_identity(G=None, grid_n=None):
         # changes, so an old file is refused rather than misread.
         "abs1",
         os.environ.get("MSOPT_MC_COLOR", os.environ.get("MSOPT_OLED_MC_COLOR", "green")),
-        os.environ.get("MSOPT_MC_STACK_KIND", "optimized"),
+        os.environ.get("MSOPT_MC_STACK_KIND", DEFAULT_STACK_KIND),
         os.environ.get("MSOPT_OLED_STACK", "microcavity"),
         round(float(np.mean(G.visible_wavelengths)), 6),
         round(float(G.Sx), 6), round(float(G.Sy), 6),
@@ -1422,6 +1511,20 @@ def planar_reference_identity(G=None, grid_n=None):
         int(G.resolution),
         int(grid_n) if grid_n is not None else "?",
         os.environ.get("MSOPT_OLED_PP_SOURCE_LAYOUT", "cell_center").strip().lower(),
+    ) + tuple(
+        # Any per-layer override from microcavity_layers belongs here too: it
+        # changes the physical stack, so a curve measured under one must never be
+        # reused under another. Appended only when an override is actually set --
+        # an empty field would still add its separator and invalidate every
+        # reference measured before this existed.
+        [",".join(f"{e[len('MSOPT_MC_'):].lower()}={os.environ[e].strip()}"
+                  for e in ("MSOPT_MC_HTL_NM", "MSOPT_MC_ETL_NM", "MSOPT_MC_CATH_NM",
+                            "MSOPT_MC_CPL_NM", "MSOPT_MC_N_CPL", "MSOPT_MC_EML_NM")
+                  if os.environ.get(e, "").strip())]
+        if any(os.environ.get(e, "").strip()
+               for e in ("MSOPT_MC_HTL_NM", "MSOPT_MC_ETL_NM", "MSOPT_MC_CATH_NM",
+                         "MSOPT_MC_CPL_NM", "MSOPT_MC_N_CPL", "MSOPT_MC_EML_NM"))
+        else []
     ))
 
 
@@ -1987,6 +2090,50 @@ MICROCAVITY_TABLE = {
                   etl_nm=30.0, cath_nm=12.0, n_cpl=1.800, ag_n=0.06, ag_k=2.66,
                   eml_n=1.78, cath_n=0.250, cath_k=2.70),
 }
+# Same solver, same materials, one different question: OLED_stack_onaxis.py
+# maximizes outcoupling SUBJECT TO the far field peaking on axis, because
+# OLED_stack_design.py optimizes total extraction and nothing else -- it does not
+# contain the word "angle". Its green stack is the honest optimum of that
+# objective and peaks 26.5 deg OFF axis at 0.573 of peak on the normal, which
+# costs front-of-screen luminance and shifts colour with viewing angle.
+#
+#   green    LEE      peak      on-axis radiance
+#   optimized 0.5725  26.5 deg  1.1956
+#   onaxis    0.5138   1.0 deg  2.1791      +82% on axis for -10.3% LEE
+#
+# The gain lives almost entirely in the capping layer: holding n_CPL at 2.20 and
+# retuning only thicknesses gives LEE 0.4675 AND on-axis 1.0957, worse than the
+# current stack on both counts. So this table requires a lower-index CPL -- a
+# materials substitution, confirmed acceptable 2026-08-20, not a thickness tweak.
+#
+# Green only for now. Red and blue keep kind="optimized" until someone runs
+# OLED_stack_onaxis.py --lam 0.62 / 0.46 and adds them here.
+MICROCAVITY_ONAXIS = {
+    "green": dict(wavelength_um=0.530, htl_nm=155.0, eml_nm=25.0, cpl_nm=80.0,
+                  etl_nm=30.0, cath_nm=10.0, n_cpl=1.90, ag_n=0.121, ag_k=3.090,
+                  eml_n=1.790, n_ito=1.950, k_ito=0.010, n_hil=1.850,
+                  n_htl=1.810, n_ebl=1.820, n_hbl=1.760, n_etl=1.750),
+}
+# One name for the default kind, used by select_stack AND by
+# planar_reference_identity. They used to carry the string "optimized"
+# separately; letting them drift would make a cached planar curve claim a stack
+# it was not measured on, which is the exact failure the identity exists to stop.
+#
+# "onaxis". It was parked on 2026-08-21 because its postprocess diverged on 4 of
+# 16 dipole cases and never reached auto-shutoff on any of them; switching the PML
+# profile to "stabilized" fixed both outright (0 divergences, 4 of 4 converged),
+# so the objection is gone.
+#
+# Measured under identical settings, planar, 3x3 tiles:
+#     optimized  LEE 0.5665   side flux 0.237   far field peaks 31 deg off axis
+#     onaxis     LEE 0.4313   side flux 0.495   peaks 5.5 deg, +93% on axis
+#
+# The trade is deliberate: nearly double the front-of-screen luminance for a
+# quarter of the total extraction. Note the side flux -- onaxis puts twice as much
+# light into laterally guided modes, so its LEE bracket at 3x3 is [0.43, 0.93] and
+# a postprocess needs more tiles here than it does for "optimized" before the
+# number is worth quoting. MSOPT_MC_STACK_KIND=optimized switches back.
+DEFAULT_STACK_KIND = "onaxis"
 MICROCAVITY_EML_LAYER = "EML"
 MICROCAVITY_FIXED_NM = dict(ag_anode=100.0, ito=10.0, hil=10.0, ebl=10.0, hbl=10.0)
 
@@ -2060,7 +2207,7 @@ def planar_requested():
     return planar_request()[1]
 
 
-def select_stack(stack="microcavity", color="green", kind="optimized",
+def select_stack(stack="microcavity", color="green", kind=DEFAULT_STACK_KIND,
                  period_legacy=2.5, period_mc=2.0):
     """The single place a run picks its layer stack, shared by every optimizer.
 
@@ -2089,7 +2236,7 @@ def select_stack(stack="microcavity", color="green", kind="optimized",
     return G, spec
 
 
-def microcavity_layers(color="green", kind="optimized"):
+def microcavity_layers(color="green", kind=DEFAULT_STACK_KIND):
     """(layer_specs, spec) for the top-emission microcavity stack.
 
     Feed layer_specs straight into build_config(layer_specs=...,
@@ -2100,14 +2247,29 @@ def microcavity_layers(color="green", kind="optimized"):
     at all -- msopt applies ONE uniform mesh to the whole domain.
     """
     kind = str(kind).strip().lower()
-    table = {"optimized": MICROCAVITY_OPTIMIZED, "table": MICROCAVITY_TABLE}.get(kind)
+    table = {"optimized": MICROCAVITY_OPTIMIZED, "table": MICROCAVITY_TABLE,
+             "onaxis": MICROCAVITY_ONAXIS}.get(kind)
     if table is None:
-        raise ValueError("kind must be 'optimized' or 'table'")
+        raise ValueError("kind must be 'optimized', 'onaxis' or 'table'")
     color = str(color).strip().lower()
     if color not in table:
         raise ValueError(f"color must be one of {sorted(table)}")
     spec = dict(table[color])
     spec["kind"] = kind
+    # Per-thickness overrides, so one layer can be moved without editing a table.
+    # Added 2026-08-21 to bisect why MICROCAVITY_ONAXIS diverges in the
+    # postprocess: the optimization is clean on it (0 divergences in 325 forward
+    # runs) and only the 5x5 PML-sided postprocess domain blows up, so the
+    # question is which of the four changed layers does it -- cathode 13->10 nm,
+    # CPL 70->80 nm, n_CPL 2.20->1.90, ETL 40->30 nm. One variable per run needs
+    # one knob per layer, not four table copies.
+    for key, env in (("htl_nm", "MSOPT_MC_HTL_NM"), ("etl_nm", "MSOPT_MC_ETL_NM"),
+                     ("cath_nm", "MSOPT_MC_CATH_NM"), ("cpl_nm", "MSOPT_MC_CPL_NM"),
+                     ("n_cpl", "MSOPT_MC_N_CPL"), ("eml_nm", "MSOPT_MC_EML_NM")):
+        raw = os.environ.get(env, "").strip()
+        if raw:
+            spec[key] = float(raw)
+            print(f"[stack] override {key} = {spec[key]:g}  (from {env})")
     wl = spec["wavelength_um"]
     um = 1e-3
     fx = MICROCAVITY_FIXED_NM
@@ -2116,10 +2278,16 @@ def microcavity_layers(color="green", kind="optimized"):
         return {"name": f"MC_{name}_sampled", "wavelength": [wl],
                 "n": [float(n)], "k": [float(k)]}
 
-    # Optimized stack uses an Ag cathode (Johnson & Christy, traceable); the
-    # table stack keeps its Mg:Ag, whose constants are a published-range estimate.
-    cath = (("Ag_cathode", spec["ag_n"], spec["ag_k"]) if kind == "optimized"
-            else ("MgAg_cathode", spec["cath_n"], spec["cath_k"]))
+    # Solver-designed stacks (optimized, onaxis) use an Ag cathode -- Johnson &
+    # Christy, traceable. Only the reconstructed table stack keeps Mg:Ag, whose
+    # constants are a published-range estimate.
+    #
+    # Keyed on what the spec actually carries, not on the kind's name: the test
+    # used to read `kind == "optimized"`, so adding "onaxis" sent it down the
+    # Mg:Ag branch and it died on a missing cath_n. Any future kind that supplies
+    # ag_n/ag_k now lands where it belongs without editing this line.
+    cath = (("MgAg_cathode", spec["cath_n"], spec["cath_k"]) if "cath_n" in spec
+            else ("Ag_cathode", spec["ag_n"], spec["ag_k"]))
     g = lambda k, d: float(spec.get(k, d))
     layer_specs = [
         ("Ag_anode_mirror", fx["ag_anode"] * um, mat("Ag", spec["ag_n"], spec["ag_k"])),
@@ -2939,12 +3107,15 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
     if pp_mode not in ("single", "n2f", "supercell", "tile"):
         raise ValueError("MSOPT_OLED_PP_MODE must be 'single' (alias 'n2f') or 'supercell' (alias 'tile').")
     pp_mode = {"n2f": "single", "tile": "supercell"}.get(pp_mode, pp_mode)
-    # Match the validated scripts: monitors are separated from the PML by the
-    # PML thickness plus a two-pixel gap, rather than sitting 0.15 um from the
-    # outer boundary where they may overlap the absorbing layer.
+    # Monitors are separated from the PML by the PML thickness plus a two-pixel
+    # gap, so they never overlap the absorber. That is what the rule always said;
+    # the code used a hard-coded 0.50 um in place of the PML thickness, which at
+    # 8 layers and 50/um is 0.16 -- three times too much, and blind to the
+    # resolution it is supposed to follow.
+    pml_um = 8.0 / max(float(G.pp_resolution), 1.0)
     monitor_boundary_inset = env_float(
         "MSOPT_OLED_PP_MONITOR_BOUNDARY_INSET_UM",
-        0.50 + 2.0 / max(float(G.pp_resolution), 1.0),
+        pml_um + 2.0 / max(float(G.pp_resolution), 1.0),
     )
     # Lateral size is set by the CAPTURE ANGLE, in both modes.
     #
@@ -2980,13 +3151,79 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
                   else max(half_needed - 0.5 * G.Sx, 0.1))
         post_sx, post_sy = G.Sx + 2.0 * pp_pad, G.Sy + 2.0 * pp_pad
     else:
-        post_sz = G.Sz + G.pp_far_z_um
-        z_shift = -0.5 * G.pp_far_z_um              # keep the stack at the same height above the bottom
+        # How much air to add above the stack. This one number drives everything
+        # downstream: it sets the monitor height, the monitor height sets the
+        # half-width needed to capture capture_deg, and that sets the tile count
+        # and therefore the cell budget. A hard-coded 2.0 um put the monitor
+        # 5.02 wavelengths above the stack for green and forced 5x5 tiles at 63M
+        # cells, where 3x3 was asked for -- and it would have been 4.3 lambda for
+        # red and 5.8 for blue, from the same constant.
+        #
+        # near2far only needs the monitor clear of the EVANESCENT near field, so
+        # the clearance belongs in wavelengths, not micrometres. Two is the
+        # default: the first evanescent lattice order of this pitch decays with
+        # 1/e length lambda/(2*pi*sqrt(u^2-1)), which is 0.13 um at u = 1.18 for
+        # green -- 2 lambda is eight of those. Orders that sit just barely above
+        # u = 1 decay far more slowly than that, but they also carry almost no
+        # power; raising MSOPT_OLED_PP_MONITOR_GAP_LAMBDA is the knob if a
+        # particular pitch puts real power there.
+        #
+        # Solving h = Sz/2 + pp_far - inset - stack_top for pp_far is what keeps
+        # the clearance fixed while the stack, the wavelength or the probe gap
+        # above the design region change underneath it.
+        lam_um = float(np.mean(G.visible_wavelengths))
+        gap_lam = env_float("MSOPT_OLED_PP_MONITOR_GAP_LAMBDA", 2.0)
+        far_env = os.environ.get("MSOPT_OLED_PP_FAR_Z_UM", "").strip()
+        if far_env:
+            pp_far = float(far_env)
+            print(f"[postprocess] air above stack {pp_far:g} um (MSOPT_OLED_PP_FAR_Z_UM)")
+        else:
+            pp_far = (gap_lam * lam_um) - 0.5 * G.Sz + monitor_boundary_inset + stack_top
+            pp_far = max(pp_far, 2.0 / max(float(G.pp_resolution), 1.0))
+            print(f"[postprocess] air above stack {pp_far:.3f} um, derived to put the "
+                  f"monitor {gap_lam:g} lambda ({gap_lam * lam_um:.3f} um) clear of the "
+                  f"stack top at lambda={lam_um:g} um")
+        post_sz = G.Sz + pp_far
+        z_shift = -0.5 * pp_far                     # keep the stack at the same height above the bottom
         monitor_z = 0.5 * post_sz - monitor_boundary_inset
         half_needed, monitor_h = _needed_half_width(monitor_z, z_shift)
-        tile_n = max(int(G.pp_min_tiles), int(np.ceil(2.0 * half_needed / G.Sx)))
+        # Tile count is PINNED, not derived. It used to be raised until the
+        # domain could geometrically capture capture_deg, which quietly turned a
+        # requested 3x3 into 5x5 and 63M cells. With the monitor now 2 lambda up
+        # instead of 5, 3x3 already captures 71 degrees for green, and the
+        # emission past that is under 1% of the total.
+        #
+        # 3x3 is a COST choice, not a converged one. Measured on one design at
+        # 4x4 dipoles: LEE 0.357 at 3x3, 0.448 at 5x5, 0.494 at 7x7, 0.517 at 9x9
+        # -- still climbing, because light the grating couples sideways needs room
+        # to work its way out. The side flux reported by
+        # MSOPT_OLED_PP_DOMAIN_FLUX is how much is still undecided (0.350 at 3x3,
+        # 0.053 at 9x9), so LEE is a lower bound and the bracket is [top, top+side].
+        # Raise MSOPT_OLED_PP_TILES when an absolute LEE matters; 3x3 is fine for
+        # comparing designs measured the same way.
+        tile_n = env_int("MSOPT_OLED_PP_TILES", 3)
         if tile_n % 2 == 0:
             tile_n += 1                              # odd -> there is a central cell
+        need_tiles = int(np.ceil(2.0 * half_needed / G.Sx))
+        if need_tiles > tile_n:
+            print(f"[postprocess] NOTE: {tile_n}x{tile_n} tiles capture less than "
+                  f"{capture_deg:g} deg ({need_tiles} would be needed); emission beyond "
+                  f"the achieved angle below is absorbed laterally and missing from LEE")
+        # The tiles fill the domain EXACTLY, so the outer ones run through the
+        # side PML. That is deliberate and must stay that way.
+        #
+        # The point of the PML sides here is to isolate ONE dipole: under Bloch
+        # boundaries every neighbouring cell would hold a coherent image of it,
+        # and the postprocess wants the single-emitter response instead. But the
+        # STRUCTURE still has to continue past the boundary, because a PML only
+        # absorbs cleanly into a medium that carries on unchanged behind it. Stop
+        # the pattern short of the absorber and you have built a real edge in the
+        # physical domain, which scatters -- the opposite of what was wanted.
+        #
+        # A MSOPT_OLED_PP_SIDE_PAD_UM knob briefly lived here, on the theory that
+        # a patterned region inside a PML was seeding the MICROCAVITY_ONAXIS
+        # divergences. It was removed: 0.4 and 0.8 um of pad both still diverged
+        # 4 of 16 cases, and the reasoning was backwards anyway.
         post_sx, post_sy = tile_n * G.Sx, tile_n * G.Sy
 
     achieved_deg = float(np.degrees(np.arctan(
@@ -3018,8 +3255,22 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
     )
 
     sim = make_sim(G, [post_sx, post_sy, post_sz], bc_x="PML", bc_y="PML", res=G.pp_resolution)
-    add_stack(G, sim, span_x=post_sx, span_y=post_sy, z_offset=z_shift)
-    half = tile_n // 2
+    # Run the geometry PAST the domain edge, one full cell beyond on every side.
+    #
+    # The lateral PML is here to isolate a SINGLE dipole -- under Bloch sides each
+    # neighbouring cell would carry a coherent image of it, which is not the
+    # response the postprocess wants. But a PML only absorbs cleanly into a medium
+    # that continues unchanged behind it. Geometry that stops exactly on the
+    # boundary leaves the outermost cells straddling an edge, and the absorber
+    # then sees a truncation rather than more of the same device.
+    #
+    # Lumerical clips whatever falls outside the FDTD region, so the overhang
+    # costs no cells -- only the extra ring of import objects, which is setup
+    # time, not solve time.
+    overhang = G.Sx
+    add_stack(G, sim, span_x=post_sx + 2.0 * overhang,
+              span_y=post_sy + 2.0 * overhang, z_offset=z_shift)
+    half = tile_n // 2 + 1
     for ix in range(-half, half + 1):
         for iy in range(-half, half + 1):
             sim.add_design_grid(
@@ -3033,6 +3284,30 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
                 float(np.mean(G.visible_wavelengths)),
             )
     sim.add_monitor(G.target_monitor_name, post_monitor_c, post_monitor_s)
+
+    # Optional six-face box just inside the PML, to find out where the light that
+    # never reaches the top monitor actually goes.
+    #
+    # LEE here is (top monitor) / (source box), so anything leaving through the
+    # SIDES is silently dropped. That is not a rounding effect: on one design the
+    # same postprocess gave 0.357 at 3x3 tiles and 0.517 at 9x9, +45%, while the
+    # capture angle only went from 71.5 to 83.9 degrees and the emission beyond
+    # 71 degrees is under 1% of the total. So the missing power is leaving
+    # sideways, and the open question is what it IS -- light still working its way
+    # out through the grating, which a wider domain would eventually collect, or
+    # light already lost to the metal. Counting it as extracted would overstate
+    # LEE; dropping it understates. Measuring it is what decides which.
+    #
+    # Diagnostic only, off by default: six extra full-domain monitors are not
+    # cheap. MSOPT_OLED_PP_DOMAIN_FLUX=1 turns it on.
+    domain_box_faces = []
+    if env_flag("MSOPT_OLED_PP_DOMAIN_FLUX", "0"):
+        dbox = [post_sx - 2.0 * monitor_boundary_inset,
+                post_sy - 2.0 * monitor_boundary_inset,
+                post_sz - 2.0 * monitor_boundary_inset]
+        domain_box_faces = add_flux_box_monitors(sim, "pp_domain_box", [0.0, 0.0, 0.0], dbox)
+        print(f"[postprocess] domain flux box {dbox[0]:.2f}x{dbox[1]:.2f}x{dbox[2]:.2f} um "
+              f"(inside the PML) -- per-face power will be reported")
 
     # Validated step1/step2 normalization: total emitted power is the outward
     # Poynting flux through a six-face box just inside the EML. dipolepower is
@@ -3363,6 +3638,27 @@ def run_postprocess(G, final_design, mapping=None, performance_spec=None):
                             if source_flux_box_faces
                             else None
                         )
+                        if domain_box_faces:
+                            # Face by face, as a fraction of what the dipole
+                            # actually emitted -- the same denominator LEE uses,
+                            # so "top" here should track the reported LEE and the
+                            # four sides are exactly what the top monitor misses.
+                            emit = valid_power(box_power) or valid_power(src_power) or 1.0
+                            share = {}
+                            for fname, fsign in domain_box_faces:
+                                try:
+                                    share[fname.rsplit("_", 1)[-1]] = (
+                                        fsign * read_transmission(sim.fdtd, fname)
+                                        * valid_power(src_power) / emit)
+                                except Exception:
+                                    share[fname.rsplit("_", 1)[-1]] = float("nan")
+                            side = sum(v for k, v in share.items() if k in ("xp", "xm", "yp", "ym"))
+                            print(f"[postprocess]   domain flux, dipole {i}: "
+                                  f"top {share.get('zp', float('nan')):+.4f}  "
+                                  f"bottom {share.get('zm', float('nan')):+.4f}  "
+                                  f"sides {side:+.4f}  "
+                                  f"(x {share.get('xp', 0):+.4f}/{share.get('xm', 0):+.4f} "
+                                  f"y {share.get('yp', 0):+.4f}/{share.get('ym', 0):+.4f})")
                     except Exception as exc:
                         last_error = str(exc)
                         if attempt < pp_retries:

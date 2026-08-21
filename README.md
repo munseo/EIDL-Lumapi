@@ -10,7 +10,7 @@ Contact: <munseongb97@gmail.com>
 Create the conda environment from the repository root:
 
 ```bash
-cd /home/eidl/EIDL-Lumapi
+cd /path/to/EIDL-Lumapi
 conda env create -f setting/environment.yml
 conda activate EIDL-Lumapi
 resource
@@ -21,7 +21,7 @@ file at `$CONDA_PREFIX/.eidl_lumapi_config.json`. It tries to detect:
 
 - license settings from `ANSYSLMD_LICENSE_FILE`, `LUMERICAL_LICENSE`,
   `LM_LICENSE_FILE`, `~/.config/Lumerical/License.ini`, or `~/ansys_license`
-- installed Lumerical versions under `/opt/lumerical/v*`
+- installed Lumerical versions under `$LUMERICAL_ROOT`, `~/lumerical/v*`, or `/opt/lumerical/v*`
 - Lumerical API and binary paths for the detected version
 
 If Lumerical is not installed but an extracted install tree or `.tar.gz` archive
@@ -30,6 +30,15 @@ is available, set this before the first `resource` or `run` command:
 ```bash
 export EIDL_LUMERICAL_INSTALLER=/path/to/lumerical-installer-or-tree
 ```
+
+For an existing installation at an arbitrary path, set `LUMERICAL_ROOT` instead:
+
+```bash
+export LUMERICAL_ROOT=/path/to/lumerical/v261
+```
+
+Set `ANSYSLMD_LICENSE_FILE`, `LUMERICAL_LICENSE`, or `LM_LICENSE_FILE` when the
+license server or file is not discoverable from the standard user locations.
 
 The first-run setup can copy a detected `v*` install tree into
 `$CONDA_PREFIX/lumerical/`. RPM installers still require manual/system
@@ -58,6 +67,17 @@ Check available Lumerical/GPU resources:
 ```bash
 resource
 ```
+
+When `ANSYSLMD_LICENSE_FILE` points to a local FlexNet `.lic` file, `resource`
+also attempts to start a local `lmgrd` automatically. Set `EIDL_LMGRD` when the
+license manager is installed at a non-standard path. The license manager must
+provide both `lmgrd` and the `ansyslmd` vendor daemon; a `.lic` file and
+`lmutil` alone cannot serve licenses.
+
+The Ansys License Manager is a licensed vendor package and is not available
+through apt/conda. After downloading it from the Ansys Customer Portal, point
+`EIDL_LMGRD` at its `lmgrd` binary (and ensure the matching `ansyslmd` binary is
+in the same directory or on `PATH`); the next `resource` command starts it.
 
 Run a simulation script with explicit Lumerical CPU threads and GPU assignment:
 

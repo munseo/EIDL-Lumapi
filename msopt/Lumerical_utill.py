@@ -1309,9 +1309,80 @@ class LumericalFDTDSimulator:
             return ""
         return text[-max_chars:]
 
+    @staticmethod
+    def _solver_log_mtime(name):
+        """Modification time of the solver's own log, or None when absent.
+
+        Taken BEFORE the run so the check afterwards can tell a fresh log from a
+        stale one: these logs are overwritten in place every iteration, so a run
+        that never reached the solver would otherwise be graded on its
+        predecessor's log.
+        """
+        try:
+            return os.path.getmtime(f"{name}_p0.log")
+        except OSError:
+            return None
+
+    def _check_convergence(self, name, before_mtime):
+        """Refuse to hand back the fields of a simulation that blew up.
+
+        Lumerical reports a diverging run only in the solver's own log; nothing
+        surfaces through the Python API, so msopt used to read whatever the dead
+        simulation left in its monitors and carry on. That is not hypothetical:
+        on 2026-08-20 every forward and adjoint run of an OLED optimization had
+        been diverging (auto-shutoff level 88342 instead of decaying below 1e-4)
+        while the driver logged nothing at all, and two full optimizations plus a
+        day of analysis were built on those fields. The postprocess used PML side
+        boundaries and was unaffected, which is exactly why the mismatch between
+        the FoM and the measured emission looked like physics.
+
+        Three outcomes, all reported:
+          diverged    fields grew instead of decaying -- raises
+          converged   the auto-shutoff criteria were met
+          timed out   the run used its whole simulation time without reaching
+                      them, so the monitors still hold ringing fields
+
+        Set MSOPT_STRICT_CONVERGENCE=0 to downgrade divergence to a warning.
+        """
+        log = f"{name}_p0.log"
+        after = self._solver_log_mtime(name)
+        if after is None or (before_mtime is not None and after <= before_mtime):
+            print(f"[FDTD] no fresh solver log for {os.path.basename(name)}; "
+                  f"convergence unverified")
+            return
+        try:
+            with open(log, "r", errors="replace") as fp:
+                text = fp.read()
+        except OSError as exc:
+            print(f"[FDTD] could not read {log} ({exc}); convergence unverified")
+            return
+        level = None
+        for chunk in text.split("Auto Shutoff:")[1:]:
+            try:
+                level = float(chunk.split()[0])
+            except (ValueError, IndexError):
+                pass
+        tag = os.path.basename(name)
+        if "fields are diverging" in text:
+            msg = (f"[FDTD] DIVERGED: {tag} was killed by the solver with the "
+                   f"fields growing (auto-shutoff level {level}). Its monitor "
+                   f"data is meaningless. Common causes: Bloch boundaries with "
+                   f"metals, PML too close to structure, or too coarse a mesh "
+                   f"across a thin metal layer.")
+            if os.environ.get("MSOPT_STRICT_CONVERGENCE", "1").strip() not in ("0", "false", "no"):
+                raise RuntimeError(msg)
+            print(msg + "  (MSOPT_STRICT_CONVERGENCE=0, continuing anyway)")
+        elif "autoshutoff criteria are satisfied" in text:
+            print(f"[FDTD] converged: {tag} (auto-shutoff {level})")
+        else:
+            print(f"[FDTD] NOT CONVERGED: {tag} used its entire simulation time "
+                  f"and stopped at auto-shutoff {level}, above the threshold -- "
+                  f"the monitors still hold un-decayed fields")
+
     def run(self,name="fdtd_tutorial",save=True):
         fsp_path = os.path.abspath(f"{name}.fsp")
         self._last_run_fsp_path = fsp_path
+        _conv_before = self._solver_log_mtime(name)
         if save:
             self.fdtd.save(fsp_path)
         self.fdtd.switchtolayout()
@@ -1331,6 +1402,7 @@ class LumericalFDTDSimulator:
                 try:
                     self._configure_session_resources()
                     self._run_session_only("FDTD", "GPU", run_name=name)
+                    self._check_convergence(name, _conv_before)
                     return
                 except Exception as exc:
                     last_error = exc
@@ -1356,6 +1428,7 @@ class LumericalFDTDSimulator:
             raise last_error
         else:
             self.fdtd.run()
+            self._check_convergence(name, _conv_before)
 
 import tempfile, os
 import scipy.io as sio

@@ -4,11 +4,20 @@
 conda env create -f setting/environment.yml
 conda activate EIDL-Lumapi
 
-# Optional: only needed when Lumerical is not already installed under /opt/lumerical/v*.
+# Optional: set this when Lumerical is installed outside ~/lumerical/v* or /opt/lumerical/v*.
 export EIDL_LUMERICAL_INSTALLER=/path/to/lumerical-installer-or-tree
+
+# Optional: point directly to an existing Lumerical installation.
+export LUMERICAL_ROOT=/path/to/lumerical/v261
+
+# Optional: set a license server (for example 27011@license-host) or license file.
+# export ANSYSLMD_LICENSE_FILE=27011@license-host
 
 # First command performs one-time Lumerical/license auto-detection.
 resource
+# If the .lic file is local, resource also starts lmgrd when available.
+# For a non-standard license manager install, set EIDL_LMGRD=/path/to/lmgrd.
+# Install the Ansys License Manager from the Ansys Customer Portal first.
 
 # Run a Lumerical simulation script.
 run script_name.py -th 8 -GPU 2

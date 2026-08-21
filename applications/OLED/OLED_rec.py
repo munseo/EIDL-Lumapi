@@ -139,11 +139,13 @@ TOP_MARGIN_UM = 0.1
 # inside the bottom PML and ends outside it. Metal terminating inside the absorber
 # is a standard divergence source; 0.35 um puts the whole mirror clear of it. The
 # mirror is opaque at 100 nm, so nothing of interest reaches the bottom anyway.
-AIR_BOT_UM = 0.1
+AIR_BOT_UM = 0.35
 os.environ.setdefault("MSOPT_OLED_AIR_BOT_UM", f"{AIR_BOT_UM:.6f}")
 STACK = "microcavity"
 MC_COLOR = "green"
-MC_STACK_KIND = "optimized"
+MC_STACK_KIND = "onaxis"   # +93% on-axis luminance; costs 24% LEE and doubles the
+                           # guided-mode share, so the postprocess needs more tiles
+                           # than "optimized" before its LEE means anything.
 
 # SYMMETRY decides what the FoM plane is and which orders are scored:
 # SYMMETRY picks the ORDER SET and the design parameterisation. The FoM monitor
@@ -185,7 +187,7 @@ N_ORDERS = 3                   # ladder: rungs / top order M. P = M*lam/sin(TARG
 AZIMUTHS_DEG = [0.0, 90.0]
 RAMP = "linear"                # "linear" interpolates W_AT_0 -> W_AT_MAX, "flat" equal
 W_AT_0 = oc.env_float("MSOPT_OLED_W_AT_0", 1.00)     # requested share at normal incidence
-W_AT_MAX = oc.env_float("MSOPT_OLED_W_AT_MAX", 0.9)  # requested share at TARGET_MAX_ANGLE;
+W_AT_MAX = oc.env_float("MSOPT_OLED_W_AT_MAX", 0.85)  # requested share at TARGET_MAX_ANGLE;
                                # rungs between are interpolated, giving a profile
                                # that peaks on axis and falls off gently.
                                # env-overridable so a ramp sweep (e.g. 0.9 vs 0.8 at
@@ -304,7 +306,7 @@ TRANS_REF = None               # |E|^2 on the EML plane that counts as T = 1.
 # COUPLED -- when making the top order unavoidably makes the one above it -- and
 # then what it really controls is how much of the target angle to give up in
 # exchange. Turn it on for a hard viewing-angle spec, not for efficiency.
-SUPPRESS_ABOVE_TARGET = oc.env_flag("MSOPT_OLED_SUPPRESS_ABOVE", "0")  # env override
+SUPPRESS_ABOVE_TARGET = oc.env_flag("MSOPT_OLED_SUPPRESS_ABOVE", "1")  # env override
 SUPPRESS_WEIGHT = 1.0          # relative to the mean target weight; 0 disables
 LEAK_TOL = oc.env_float("MSOPT_OLED_LEAK_TOL", 0.05)
                                # minimax only: the share of EML power allowed to
@@ -330,11 +332,11 @@ SUPPRESS_AGGREGATE = True      # score all leaking orders in ONE objective, so
 # mode -- also 1 adjoint instead of 7.
 
 # explicit mode only: (theta_air_deg, phi_deg)
-TARGET_ALL_ORDERS = oc.env_flag("MSOPT_OLED_ALL_ORDERS", "0")   # env override.
+TARGET_ALL_ORDERS = oc.env_flag("MSOPT_OLED_ALL_ORDERS", "1")   # env override.
                                # score EVERY escaping (m,n), grouped into cones by |u|
 TARGET_ANGLES = [(0.0, 0.0), (45.0, 0.0), (45.0, 90.0)]
 PERIOD_UM = None               # None -> pitch derived from the targets
-SOURCE_POL = oc.env_str("MSOPT_OLED_SOURCE_POL", "x")   # "x", "y" or "xy"
+SOURCE_POL = oc.env_str("MSOPT_OLED_SOURCE_POL", "xy")   # "x", "y" or "xy"
                                # ("xy" = one 45-deg linear probe, both components
                                #  scored -- see _pol_components)
 if SOURCE_POL not in ("x", "y", "xy"):
@@ -1649,6 +1651,55 @@ def _split_per_J(per_J):
     return purities, level, match
 
 
+def save_angular_target(path):
+    """Dump the angular target this run optimized against, for the postprocess.
+
+    oled_common.load_optimization_angular_target looks for this file next to
+    lastdesign.txt, and when it finds one the postprocess re-evaluates the FoM's
+    OWN match on the measured far field -- the only number that puts the
+    optimizer's score and the real emission in the same units. Nothing was
+    writing it, despite the loader's docstring claiming "every optimization run
+    writes" it, so that comparison had never run once: every manifest so far
+    carried an empty optimization_target_match.
+
+    The convention is fixed by the consumer, optimization_target_match:
+      angle_thetas    EVERY ring, suppressed ones included -- it assigns each
+                      propagating direction to its nearest ring, so a missing
+                      suppressed ring would fold leaked power into a target's
+      target_profile  normalized over the IN-RANGE rings alone, because match
+                      compares it against q = profile / throughput
+      in_range        the rings the FoM actually scores
+
+    Failure here must not cost a finished optimization its postprocess, so the
+    write is reported and swallowed rather than raised.
+    """
+    try:
+        merged = {}
+        for mo in target_modes:
+            t = round(float(mo["theta_air_deg"]), 4)
+            scored = not bool(mo["suppress"])
+            w_prev, keep_prev = merged.get(t, (0.0, False))
+            # A repeated theta (the k-map can list one twice) merges instead of
+            # letting argmin silently pick whichever came first.
+            merged[t] = (w_prev + (float(mo["weight"]) if scored else 0.0),
+                         keep_prev or scored)
+        thetas = np.array(sorted(merged), dtype=float)
+        weights = np.array([merged[t][0] for t in thetas], dtype=float)
+        in_range = np.array([merged[t][1] for t in thetas], dtype=bool)
+        total = float(weights[in_range].sum())
+        if total <= 0.0:
+            raise ValueError("no positive in-range weight")
+        profile = np.zeros_like(weights)
+        profile[in_range] = weights[in_range] / total
+        np.savez(path, angle_thetas=thetas, target_profile=profile, in_range=in_range)
+        print("[target] wrote " + path + ": " + ", ".join(
+            f"{t:.2f}deg->{p:.4f}" + ("" if r else " (SUP)")
+            for t, p, r in zip(thetas, profile, in_range)))
+    except Exception as exc:
+        print(f"[target] could not write the angular target ({exc}); the "
+              f"postprocess will skip the FoM-vs-measured comparison")
+
+
 def _plot_state(X, purities, level, match, val, opt, hist, trial):
     """Refresh the rolling figure, ONE point per msopt iteration.
 
@@ -1948,6 +1999,8 @@ def main():
         design_path = os.environ.get("MSOPT_OLED_POSTPROCESS_DESIGN", "").strip()
         if not (design_path and os.path.exists(design_path)):
             design_path = os.path.join(G.design_dir, "lastdesign.txt")
+        save_angular_target(os.path.join(
+            os.path.dirname(os.path.abspath(design_path)), "OLED_angular_target.npz"))
         if oc.planar_requested() and not os.path.exists(design_path):
             print("[postprocess] PLANAR stack characterization (no design required)")
             oc.run_postprocess(G, np.zeros(int(np.prod(G.design_grids)), float), mapping=None)
